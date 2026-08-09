@@ -68,5 +68,9 @@ void basht_child_stdio (void);  /* forked child: attach capture ptys
                                    tty on fds 1/2 */
 void basht_fork_prepare (const char *, int); /* parent, pre-fork  */
 void basht_fork_done (pid_t);                /* parent, post-fork */
+int  basht_fg_pump (pid_t);     /* fg wait loop: drain + relay; 1 if
+                                   pumped (reap WNOHANG), 0 = block */
+void basht_fg_end (void);       /* fg wait over: restore terminal */
+int  basht_send_input (int, const char *);   /* `in' builtin */
 
 #endif /* _BASHT_H_ */

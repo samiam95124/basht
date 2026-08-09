@@ -1,0 +1,96 @@
+This file is feed.def, from which is created feed.c.
+It implements the builtin "feed" in Bash.
+
+Copyright (C) 2026 Free Software Foundation, Inc.
+
+This file is part of GNU Bash, the Bourne Again SHell.
+
+Bash is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Bash is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+
+$PRODUCES feed.c
+
+$BUILTIN feed
+$FUNCTION feed_builtin
+$SHORT_DOC feed id text ...
+Send a line of input to a multiplexed task.
+
+Writes TEXT (the remaining arguments, joined by single spaces),
+followed by a newline, to the standard input of the task whose
+display tag is [name:ID], without foregrounding it. The task ids
+are the numbers shown in the output tags.
+
+(This is the `in' builtin of the tsh design; `in' itself is a
+shell reserved word and cannot name a builtin.)
+
+Exit Status:
+Returns success unless ID does not name a live captured task.
+$END
+
+#include <config.h>
+
+#if defined (HAVE_UNISTD_H)
+#  include <unistd.h>
+#endif
+
+#include "../bashintl.h"
+#include "../shell.h"
+#include "common.h"
+
+extern int basht_active;
+extern int basht_send_input (int, const char *);
+
+int
+feed_builtin (WORD_LIST *list)
+{
+  WORD_LIST *l;
+  intmax_t id;
+  char line[4096];
+  size_t n, w;
+
+  if (list == 0 || list->next == 0)
+    {
+      builtin_usage ();
+      return (EX_USAGE);
+    }
+  if (basht_active == 0)
+    {
+      builtin_error (_("task multiplexer is not active"));
+      return (EXECUTION_FAILURE);
+    }
+  if (valid_number (list->word->word, &id) == 0 || id <= 0)
+    {
+      sh_invalidnum (list->word->word);
+      return (EXECUTION_FAILURE);
+    }
+
+  n = 0;
+  for (l = list->next; l; l = l->next)
+    {
+      w = strlen (l->word->word);
+      if (n + w + 2 > sizeof line)
+	break;
+      memcpy (line + n, l->word->word, w);
+      n += w;
+      if (l->next)
+	line[n++] = ' ';
+    }
+  line[n] = '\0';
+
+  if (basht_send_input ((int)id, line) < 0)
+    {
+      builtin_error (_("%d: no such task"), (int)id);
+      return (EXECUTION_FAILURE);
+    }
+  return (EXECUTION_SUCCESS);
+}

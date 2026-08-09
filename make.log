@@ -1,54 +1,59 @@
+rm -f execute_cmd.o
+rm -f variables.o
+rm -f expr.o
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c execute_cmd.c
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c variables.c
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c expr.c
 rm -f jobs.o
+rm -f subst.o
 gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c jobs.c
-/bin/sh ./support/mkversion.sh -b -S . -s release -d 5.3 -o newversion.h \
-	&& mv newversion.h version.h
-rm -f basht.o
+rm -f trap.o
+rm -f sig.o
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c subst.c
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c trap.c
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c sig.c
+rm -f bashline.o
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c bashline.c
 make[1]: Entering directory '/home/samiam/projects/task_mux/basht/builtins'
 make[1]: 'pipesize.h' is up to date.
 make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/builtins'
-gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c basht.c
-rm -f version.o
-gcc -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security  -g -O2  -DBUILDTOOL -c -o buildversion.o ./version.c
-gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c version.c
-gcc -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security  -g -O2   -rdynamic -g -O2   -rdynamic -g -O2  -o bashversion ./support/bashversion.c buildversion.o 
+rm -f pcomplete.o
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c pcomplete.c
 
 	  ***********************************************************
 	  *                                                         *
-	  * GNU bash, version 5.3.15(5)-release (x86_64-pc-linux-gnu)
+	  * GNU bash, version 5.3.15(6)-release (x86_64-pc-linux-gnu)
 	  *                                                         *
 	  ***********************************************************
 
 making lib/glob/libglob.a in ./lib/glob
-making lib/sh/libsh.a in ./lib/sh
-making lib/readline/libreadline.a in ./lib/readline
-making lib/tilde/libtilde.a in ./lib/tilde
 make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/glob'
 make[1]: 'libglob.a' is up to date.
 make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/glob'
-make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/malloc'
-rm -f libmalloc.a
-make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/tilde'
-make[1]: 'libtilde.a' is up to date.
-make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/tilde'
-ar cr libmalloc.a malloc.o  trace.o stats.o table.o watch.o
-make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/readline'
-make[1]: 'libreadline.a' is up to date.
-make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/readline'
-making lib/readline/libhistory.a in ./lib/readline
+making lib/sh/libsh.a in ./lib/sh
 make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/sh'
 make[1]: 'libsh.a' is up to date.
 make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/sh'
+making lib/readline/libreadline.a in ./lib/readline
+make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/readline'
+make[1]: 'libreadline.a' is up to date.
+make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/readline'
+making lib/tilde/libtilde.a in ./lib/tilde
+make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/tilde'
+make[1]: 'libtilde.a' is up to date.
+make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/tilde'
+making lib/readline/libhistory.a in ./lib/readline
 make[1]: Entering directory '/home/samiam/projects/task_mux/basht/lib/readline'
 make[1]: 'libhistory.a' is up to date.
 make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/readline'
-test -n "ranlib" && ranlib libmalloc.a
-make[1]: Leaving directory '/home/samiam/projects/task_mux/basht/lib/malloc'
+rm -f y.tab.o
+gcc  -DPROGRAM='"bash"' -DCONF_HOSTTYPE='"x86_64"' -DCONF_OSTYPE='"linux-gnu"' -DCONF_MACHTYPE='"x86_64-pc-linux-gnu"' -DCONF_VENDOR='"pc"' -DLOCALEDIR='"/usr/local/share/locale"' -DPACKAGE='"bash"' -DSHELL -DHAVE_CONFIG_H   -I.  -I. -I./include -I./lib  -Wno-parentheses -Wno-format-security   -g -O2 -c y.tab.c
 rm -f bash
 gcc -L./builtins -L./lib/readline -L./lib/readline -L./lib/glob -L./lib/tilde -L./lib/malloc -L./lib/sh  -rdynamic -g -O2   -o bash shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o dispose_cmd.o execute_cmd.o variables.o copy_cmd.o error.o expr.o flags.o jobs.o subst.o hashcmd.o hashlib.o mailcheck.o trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o alias.o array.o arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o bashline.o  list.o stringlib.o locale.o findcmd.o redir.o pcomplete.o pcomplib.o syntax.o xmalloc.o  basht.o basht_filter.o basht_display.o -lbuiltins -lglob -lsh -lreadline -lhistory -ltermcap -ltilde -lmalloc    -ldl 
 /usr/bin/ld: ./lib/sh/libsh.a(tmpfile.o): in function `sh_mktmpname':
 /home/samiam/projects/task_mux/basht/lib/sh/tmpfile.c:173: warning: the use of `mktemp' is dangerous, better use `mkstemp' or `mkdtemp'
 ls -l bash
--rwxrwxr-x 1 samiam samiam 6686536 Aug  9 10:23 bash
+-rwxrwxr-x 1 samiam samiam 6708248 Aug  9 11:19 bash
 size bash
    text	   data	    bss	    dec	    hex	filename
-1326712	  49184	1118696	2494592	 261080	bash
+1330762	  49288	1127656	2507706	 2643ba	bash

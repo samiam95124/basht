@@ -3164,7 +3164,16 @@ wait_for (pid_t pid, int flags)
 	     everything that happened before we switch the behavior of
 	     trap_handler to longjmp on a trapped signal (waiting_for_child) */
 	  CHECK_WAIT_INTR;
-	  r = waitchld (pid, 1);	/* XXX */
+	  /* basht: while a foreground job runs, keep draining all
+	     pty masters and relaying the keyboard instead of
+	     blocking in waitpid (the multiplexer never stops). */
+	  {
+	    extern int basht_fg_pump (pid_t);
+	    if (basht_fg_pump (pid))
+	      r = waitchld (pid, 0);
+	    else
+	      r = waitchld (pid, 1);	/* XXX */
+	  }
 	  waiting_for_child = old_waiting;
 #if 0
 itrace("wait_for: blocking wait for %d returns %d child = %p", (int)pid, r, child);
@@ -3225,6 +3234,13 @@ itrace("wait_for: blocking wait for %d returns %d child = %p", (int)pid, r, chil
 	}
     }
   while (PRUNNING (child) || (job != NO_JOB && RUNNING (job)));
+
+  /* basht: the foreground wait is over; restore the terminal and
+     drop the pending-input display. */
+  {
+    extern void basht_fg_end (void);
+    basht_fg_end ();
+  }
 
   /* Restore the original SIGINT signal handler before we return. */
   restore_sigint_handler ();
@@ -5021,6 +5037,15 @@ give_terminal_to (pid_t pgrp, int force)
 {
   sigset_t set, oset;
   int r, e;
+
+  /* basht: nobody but the shell ever owns the real terminal; jobs
+     talk to their own ptys and signals are delivered with killpg.
+     That is the point of the design. */
+  {
+    extern int basht_active;
+    if (basht_active)
+      return 0;
+  }
 
   r = 0;
   if (job_control || force)

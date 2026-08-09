@@ -19,11 +19,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "bashtypes.h"
@@ -40,15 +42,16 @@ int basht_tty = -1;
 static BASHT_STREAM self;	/* task 0 */
 static int self_master = -1;	/* master side of task 0's pty */
 
-/* Phase 2: captured background tasks. Each async top-level child
-   gets an out pty and an err pty; the masters are drained here and
-   displayed as tagged lines. Pipes and redirections applied after
-   fork override the slaves, so only terminal-bound streams are
-   captured. */
+/* Captured tasks. Every job-table child (foreground or background;
+   not comsub/procsub) gets an in, an out and an err pty; the
+   masters are drained here and displayed as tagged lines. Pipes and
+   redirections applied after fork override the slaves, so only
+   terminal-bound streams are captured. */
 #define BASHT_MAX_CAPS 64
 
 struct basht_cap {
-  int m_out, m_err;		/* master fds; -1 = closed */
+  int m_in, m_out, m_err;	/* master fds; -1 = closed */
+  pid_t pid;
   BASHT_STREAM out, err;
 };
 static struct basht_cap caps[BASHT_MAX_CAPS];
@@ -56,7 +59,7 @@ static int next_task_id = 1;
 
 /* pending capture between basht_fork_prepare() and the fork */
 static int  pend_slot = -1;
-static char pend_sout[64], pend_serr[64];
+static char pend_sin[64], pend_sout[64], pend_serr[64];
 
 static int
 open_master (char *sname, size_t cap)
@@ -111,14 +114,28 @@ cap_name (const char *command, char *out, size_t cap)
 static void
 cap_free (struct basht_cap *cp)
 {
+  if (cp->m_in >= 0)
+    close (cp->m_in);
   if (cp->m_out >= 0)
     close (cp->m_out);
   if (cp->m_err >= 0)
     close (cp->m_err);
-  cp->m_out = cp->m_err = -1;
+  cp->m_in = cp->m_out = cp->m_err = -1;
   basht_display_stream_gone (&cp->out);
   basht_display_stream_gone (&cp->err);
   cp->out.id = 0;
+  cp->pid = -1;
+}
+
+static struct basht_cap *
+cap_by_pid (pid_t pid)
+{
+  int i;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    if (caps[i].pid == pid && caps[i].out.id != 0)
+      return &caps[i];
+  return 0;
 }
 
 /* Called in the parent just before fork. Decides whether this child
@@ -135,33 +152,30 @@ basht_fork_prepare (const char *command, int flags)
       cap_free (&caps[pend_slot]);
       pend_slot = -1;
     }
-  if (basht_active == 0 || (flags & FORK_ASYNC) == 0
-      || (flags & (FORK_COMSUB | FORK_PROCSUB)))
+  if (basht_active == 0 || (flags & (FORK_COMSUB | FORK_PROCSUB)))
     return;
 
   for (i = 0; i < BASHT_MAX_CAPS; i++)
-    if (caps[i].m_out < 0 && caps[i].m_err < 0)
+    if (caps[i].m_in < 0 && caps[i].m_out < 0 && caps[i].m_err < 0)
       break;
   if (i == BASHT_MAX_CAPS)
     return;			/* table full: run uncaptured */
   cp = &caps[i];
 
   memset (cp, 0, sizeof *cp);
+  cp->pid = -1;
+  cp->m_in = open_master (pend_sin, sizeof pend_sin);
   cp->m_out = open_master (pend_sout, sizeof pend_sout);
-  if (cp->m_out < 0)
-    {
-      cp->m_out = cp->m_err = -1;
-      return;
-    }
   cp->m_err = open_master (pend_serr, sizeof pend_serr);
-  if (cp->m_err < 0)
+  if (cp->m_in < 0 || cp->m_out < 0 || cp->m_err < 0)
     {
-      close (cp->m_out);
-      cp->m_out = cp->m_err = -1;
+      cap_free (cp);
       return;
     }
 
   cap_name (command, cp->out.name, sizeof cp->out.name);
+  if (cp->out.name[0] == '(')	/* subshell command text */
+    strcpy (cp->out.name, "sub");
   strcpy (cp->err.name, cp->out.name);
   cp->out.id = cp->err.id = next_task_id++;
   cp->out.mark = 0;
@@ -179,6 +193,8 @@ basht_fork_done (pid_t pid)
     return;
   if (pid < 0)
     cap_free (&caps[pend_slot]);
+  else
+    caps[pend_slot].pid = pid;
   pend_slot = -1;
 }
 
@@ -246,6 +262,9 @@ drain_caps (void)
     {
       drain_cap_fd (&caps[i].m_out, &caps[i].out);
       drain_cap_fd (&caps[i].m_err, &caps[i].err);
+      /* both output streams gone: the task is over; release */
+      if (caps[i].m_out < 0 && caps[i].m_err < 0 && caps[i].m_in >= 0)
+	cap_free (&caps[i]);
     }
 }
 
@@ -272,6 +291,195 @@ basht_command_begin (void)
   basht_drain ();
   basht_display_set_default (0);
   basht_display_sync ();
+}
+
+/* ---- phase 3: the foreground pump --------------------------------
+
+   Called from wait_for's wait loop in place of blocking in
+   waitpid. Keeps every pty draining while a foreground job runs,
+   and relays the real keyboard to the job: the terminal goes raw
+   (ISIG off), typed characters build the job's pending input line
+   (displayed as "[name:N<] text"), Enter ships it to the job's in
+   pty, ^C/^Z become killpg(SIGINT/SIGTSTP) on the job's process
+   group, ^D sends VEOF. Returns 1 if it pumped (caller should then
+   reap with WNOHANG), 0 to fall back to a blocking wait. */
+
+static struct termios fg_tio_save;
+static int   fg_raw = 0;
+static int   fg_stdin_open = 1;
+static pid_t fg_pid = -1;
+static BASHT_STREAM fg_rly;
+
+static void
+fg_signal (pid_t pid, int sig)
+{
+  pid_t pg = getpgid (pid);
+
+  if (pg > 0)
+    killpg (pg, sig);
+  else
+    kill (pid, sig);
+}
+
+int
+basht_fg_pump (pid_t pid)
+{
+  struct basht_cap *cp;
+  fd_set rf;
+  struct timeval tv;
+  int maxfd, r, i;
+
+  if (basht_active == 0)
+    return 0;
+
+  cp = pid > 0 ? cap_by_pid (pid) : 0;
+
+  /* new foreground episode with a captured job: go raw and relay */
+  if (cp && cp->m_in >= 0 && fg_pid != pid)
+    {
+      if (fg_raw == 0 && isatty (0) && tcgetattr (0, &fg_tio_save) == 0)
+	{
+	  struct termios t = fg_tio_save;
+	  t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG);
+	  t.c_cc[VMIN] = 1;
+	  t.c_cc[VTIME] = 0;
+	  if (tcsetattr (0, TCSANOW, &t) == 0)
+	    fg_raw = 1;
+	}
+      fg_pid = pid;
+      fg_stdin_open = 1;
+      memset (&fg_rly, 0, sizeof fg_rly);
+      strcpy (fg_rly.name, cp->out.name);
+      fg_rly.id = cp->out.id;
+      fg_rly.mark = '<';
+    }
+
+  basht_drain ();
+
+  FD_ZERO (&rf);
+  maxfd = -1;
+  if (fg_raw && fg_stdin_open)
+    {
+      FD_SET (0, &rf);
+      maxfd = 0;
+    }
+  if (self_master >= 0)
+    {
+      FD_SET (self_master, &rf);
+      if (self_master > maxfd)
+	maxfd = self_master;
+    }
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      if (caps[i].m_out >= 0)
+	{
+	  FD_SET (caps[i].m_out, &rf);
+	  if (caps[i].m_out > maxfd)
+	    maxfd = caps[i].m_out;
+	}
+      if (caps[i].m_err >= 0)
+	{
+	  FD_SET (caps[i].m_err, &rf);
+	  if (caps[i].m_err > maxfd)
+	    maxfd = caps[i].m_err;
+	}
+    }
+  tv.tv_sec = 0;
+  tv.tv_usec = 200000;
+  r = select (maxfd + 1, &rf, 0, 0, &tv);
+
+  if (r > 0 && fg_raw && fg_stdin_open && FD_ISSET (0, &rf) && cp)
+    {
+      char buf[256];
+      ssize_t n = read (0, buf, sizeof buf);
+      if (n == 0)
+	{
+	  char e = 0x04;
+	  if (cp->m_in >= 0)
+	    basht_write_all (cp->m_in, &e, 1);
+	  fg_stdin_open = 0;
+	}
+      else
+	for (ssize_t k = 0; k < n; k++)
+	  {
+	    unsigned char c = (unsigned char)buf[k];
+	    if (c == 0x03)		/* ^C */
+	      fg_signal (pid, SIGINT);
+	    else if (c == 0x1a)		/* ^Z */
+	      fg_signal (pid, SIGTSTP);
+	    else if (c == 0x04)		/* ^D */
+	      {
+		char e = 0x04;
+		if (cp->m_in >= 0)
+		  basht_write_all (cp->m_in, &e, 1);
+	      }
+	    else if (c == '\r' || c == '\n')
+	      {
+		basht_display_line (&fg_rly, fg_rly.lb.data, fg_rly.lb.len);
+		if (cp->m_in >= 0)
+		  {
+		    fg_rly.lb.data[fg_rly.lb.len] = '\n';
+		    basht_write_all (cp->m_in, fg_rly.lb.data,
+				     fg_rly.lb.len + 1);
+		  }
+		fg_rly.lb.len = fg_rly.lb.cur = 0;
+		basht_display_partial (&fg_rly);
+	      }
+	    else if (c == 0x7f || c == '\b')
+	      {
+		if (fg_rly.lb.len > 0)
+		  fg_rly.lb.cur = --fg_rly.lb.len;
+		basht_display_partial (&fg_rly);
+	      }
+	    else if (c == '\t' || c >= 0x20)
+	      {
+		if (fg_rly.lb.len < BASHT_LINEBUF_CAP - 2)
+		  {
+		    fg_rly.lb.data[fg_rly.lb.len++] = (char)c;
+		    fg_rly.lb.cur = fg_rly.lb.len;
+		  }
+		basht_display_partial (&fg_rly);
+	      }
+	    /* other control characters are dropped */
+	  }
+    }
+
+  basht_drain ();
+  return 1;
+}
+
+/* The foreground wait is over: restore the terminal, drop the
+   pending-input display. */
+void
+basht_fg_end (void)
+{
+  if (basht_active == 0)
+    return;
+  if (fg_raw)
+    {
+      tcsetattr (0, TCSANOW, &fg_tio_save);
+      fg_raw = 0;
+    }
+  fg_pid = -1;
+  fg_rly.lb.len = fg_rly.lb.cur = 0;
+  basht_display_stream_gone (&fg_rly);
+  basht_drain ();
+}
+
+/* `in' builtin: one line of text to task ID's stdin. */
+int
+basht_send_input (int id, const char *text)
+{
+  int i;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    if (caps[i].out.id == id && caps[i].m_in >= 0)
+      {
+	basht_write_all (caps[i].m_in, text, strlen (text));
+	basht_write_all (caps[i].m_in, "\n", 1);
+	return 0;
+      }
+  return -1;
 }
 
 /* readline's character source. Instead of rl_event_hook (whose
@@ -380,7 +588,10 @@ basht_init (void)
   basht_display_set_default (&self);
 
   for (int i = 0; i < BASHT_MAX_CAPS; i++)
-    caps[i].m_out = caps[i].m_err = -1;
+    {
+      caps[i].m_in = caps[i].m_out = caps[i].m_err = -1;
+      caps[i].pid = -1;
+    }
 
   rl_getc_function = basht_getc;
 
@@ -399,18 +610,24 @@ basht_child_stdio (void)
   if (pend_slot >= 0)
     {
       /* captured child: attach this task's pty slaves */
+      int in = open (pend_sin, O_RDWR | O_NOCTTY);
       int o = open (pend_sout, O_RDWR | O_NOCTTY);
       int e = open (pend_serr, O_RDWR | O_NOCTTY);
-      if (o >= 0 && e >= 0)
+      if (in >= 0 && o >= 0 && e >= 0)
 	{
+	  dup2 (in, 0);
 	  dup2 (o, 1);
 	  dup2 (e, 2);
+	  if (in > 2)
+	    close (in);
 	  if (o > 2)
 	    close (o);
 	  if (e > 2)
 	    close (e);
 	  return;
 	}
+      if (in >= 0)
+	close (in);
       if (o >= 0)
 	close (o);
       if (e >= 0)
