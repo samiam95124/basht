@@ -22,19 +22,22 @@ $PRODUCES feed.c
 
 $BUILTIN feed
 $FUNCTION feed_builtin
-$SHORT_DOC feed id text ...
+$SHORT_DOC feed name[:n] text ...
 Send a line of input to a multiplexed task.
 
 Writes TEXT (the remaining arguments, joined by single spaces),
-followed by a newline, to the standard input of the task whose
-display tag is [name:ID], without foregrounding it. The task ids
-are the numbers shown in the output tags.
+followed by a newline, to the standard input of the named task,
+without foregrounding it. Tasks are addressed by their display
+tag: `feed hello:2 ...' feeds the task tagged [hello:2] (the
+second hello of the session). The :n part may be omitted when
+exactly one task with that name is alive.
 
 (This is the `in' builtin of the tsh design; `in' itself is a
 shell reserved word and cannot name a builtin.)
 
 Exit Status:
-Returns success unless ID does not name a live captured task.
+Returns success unless the spec names no live task, or names more
+than one and :n was omitted.
 $END
 
 #include <config.h>
@@ -48,15 +51,18 @@ $END
 #include "common.h"
 
 extern int basht_active;
-extern int basht_send_input (int, const char *);
+extern int basht_send_input (const char *, int, const char *);
 
 int
 feed_builtin (WORD_LIST *list)
 {
   WORD_LIST *l;
-  intmax_t id;
+  intmax_t inst;
+  char *spec, *colon;
+  char name[64];
   char line[4096];
   size_t n, w;
+  int r;
 
   if (list == 0 || list->next == 0)
     {
@@ -68,11 +74,29 @@ feed_builtin (WORD_LIST *list)
       builtin_error (_("task multiplexer is not active"));
       return (EXECUTION_FAILURE);
     }
-  if (valid_number (list->word->word, &id) == 0 || id <= 0)
+
+  /* task spec: name or name:n */
+  spec = list->word->word;
+  inst = -1;
+  colon = strrchr (spec, ':');
+  if (colon)
     {
-      sh_invalidnum (list->word->word);
+      if (valid_number (colon + 1, &inst) == 0 || inst <= 0)
+	{
+	  sh_invalidnum (colon + 1);
+	  return (EXECUTION_FAILURE);
+	}
+      w = (size_t)(colon - spec);
+    }
+  else
+    w = strlen (spec);
+  if (w == 0 || w >= sizeof name)
+    {
+      builtin_error (_("%s: invalid task name"), spec);
       return (EXECUTION_FAILURE);
     }
+  memcpy (name, spec, w);
+  name[w] = '\0';
 
   n = 0;
   for (l = list->next; l; l = l->next)
@@ -87,9 +111,15 @@ feed_builtin (WORD_LIST *list)
     }
   line[n] = '\0';
 
-  if (basht_send_input ((int)id, line) < 0)
+  r = basht_send_input (name, (int)inst, line);
+  if (r == -2)
     {
-      builtin_error (_("%d: no such task"), (int)id);
+      builtin_error (_("%s: several tasks match; use %s:n"), spec, name);
+      return (EXECUTION_FAILURE);
+    }
+  if (r < 0)
+    {
+      builtin_error (_("%s: no such task"), spec);
       return (EXECUTION_FAILURE);
     }
   return (EXECUTION_SUCCESS);

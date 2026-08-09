@@ -55,7 +55,33 @@ struct basht_cap {
   BASHT_STREAM out, err;
 };
 static struct basht_cap caps[BASHT_MAX_CAPS];
-static int next_task_id = 1;
+
+/* Task ids are per name: [hello:2] is the second hello started this
+   session. Instance counts never reset, so an id always denotes the
+   same task for the whole session. */
+static struct {
+  char name[BASHT_NAME_MAX];
+  int n;
+} insts[BASHT_MAX_CAPS];
+static int insts_used;
+static int overflow_id = 1000;	/* name table full: unique-ish ids */
+
+static int
+next_instance (const char *name)
+{
+  int i;
+
+  for (i = 0; i < insts_used; i++)
+    if (strcmp (insts[i].name, name) == 0)
+      return ++insts[i].n;
+  if (insts_used < BASHT_MAX_CAPS)
+    {
+      strcpy (insts[insts_used].name, name);
+      insts[insts_used].n = 1;
+      return insts[insts_used++].n;
+    }
+  return ++overflow_id;
+}
 
 /* pending capture between basht_fork_prepare() and the fork */
 static int  pend_slot = -1;
@@ -177,7 +203,7 @@ basht_fork_prepare (const char *command, int flags)
   if (cp->out.name[0] == '(')	/* subshell command text */
     strcpy (cp->out.name, "sub");
   strcpy (cp->err.name, cp->out.name);
-  cp->out.id = cp->err.id = next_task_id++;
+  cp->out.id = cp->err.id = next_instance (cp->out.name);
   cp->out.mark = 0;
   cp->err.mark = '!';
   pend_slot = i;
@@ -473,20 +499,28 @@ basht_fg_end (void)
   basht_drain ();
 }
 
-/* `in' builtin: one line of text to task ID's stdin. */
+/* `feed' builtin: one line of text to a task's stdin. INST <= 0
+   means "the only live task with this name"; returns -2 if that is
+   ambiguous, -1 if there is no match, 0 on success. */
 int
-basht_send_input (int id, const char *text)
+basht_send_input (const char *name, int inst, const char *text)
 {
-  int i;
+  int i, found = -1;
 
   for (i = 0; i < BASHT_MAX_CAPS; i++)
-    if (caps[i].out.id == id && caps[i].m_in >= 0)
+    if (caps[i].m_in >= 0 && caps[i].out.id != 0
+	&& strcmp (caps[i].out.name, name) == 0
+	&& (inst <= 0 || caps[i].out.id == inst))
       {
-	basht_write_all (caps[i].m_in, text, strlen (text));
-	basht_write_all (caps[i].m_in, "\n", 1);
-	return 0;
+	if (inst <= 0 && found >= 0)
+	  return -2;
+	found = i;
       }
-  return -1;
+  if (found < 0)
+    return -1;
+  basht_write_all (caps[found].m_in, text, strlen (text));
+  basht_write_all (caps[found].m_in, "\n", 1);
+  return 0;
 }
 
 /* readline's character source. Instead of rl_event_hook (whose

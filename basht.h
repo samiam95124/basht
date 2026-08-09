@@ -71,6 +71,8 @@ void basht_fork_done (pid_t);                /* parent, post-fork */
 int  basht_fg_pump (pid_t);     /* fg wait loop: drain + relay; 1 if
                                    pumped (reap WNOHANG), 0 = block */
 void basht_fg_end (void);       /* fg wait over: restore terminal */
-int  basht_send_input (int, const char *);   /* `in' builtin */
+int  basht_send_input (const char *, int, const char *);
+                                /* `feed' builtin: name, instance
+                                   (<=0 = sole live match), text */
 
 #endif /* _BASHT_H_ */
