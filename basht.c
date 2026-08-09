@@ -52,6 +52,7 @@ static int self_master = -1;	/* master side of task 0's pty */
 struct basht_cap {
   int m_in, m_out, m_err;	/* master fds; -1 = closed */
   pid_t pid;
+  int lines;			/* per-task displayed-line counter */
   BASHT_STREAM out, err;
 };
 static struct basht_cap caps[BASHT_MAX_CAPS];
@@ -206,6 +207,7 @@ basht_fork_prepare (const char *command, int flags)
   cp->out.id = cp->err.id = next_instance (cp->out.name);
   cp->out.mark = 0;
   cp->err.mark = '!';
+  cp->out.lines = cp->err.lines = &cp->lines;
   pend_slot = i;
 }
 
@@ -220,7 +222,10 @@ basht_fork_done (pid_t pid)
   if (pid < 0)
     cap_free (&caps[pend_slot]);
   else
-    caps[pend_slot].pid = pid;
+    {
+      caps[pend_slot].pid = pid;
+      caps[pend_slot].out.pid = caps[pend_slot].err.pid = pid;
+    }
   pend_slot = -1;
 }
 
@@ -378,6 +383,8 @@ basht_fg_pump (pid_t pid)
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
       fg_rly.mark = '<';
+      fg_rly.pid = cp->pid;
+      fg_rly.lines = cp->out.lines;
     }
 
   basht_drain ();
@@ -626,6 +633,11 @@ basht_init (void)
   memset (&self, 0, sizeof self);
   strcpy (self.name, "bash");
   self.id = 0;
+  self.pid = getpid ();
+  {
+    static int self_lines;
+    self.lines = &self_lines;
+  }
   basht_display_set_default (&self);
 
   for (int i = 0; i < BASHT_MAX_CAPS; i++)

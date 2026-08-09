@@ -536,6 +536,8 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O) \
 	   basht.o basht_filter.o basht_display.o
 
+basht.o basht_filter.o basht_display.o: basht.h
+
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
 DEFSRC=$(BUILTIN_SRCDIR)

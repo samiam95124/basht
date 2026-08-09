@@ -13,6 +13,7 @@
 #define _BASHT_H_
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #define BASHT_LINEBUF_CAP 8192
 #define BASHT_NAME_MAX    64
@@ -39,6 +40,9 @@ typedef struct basht_stream {
   int  id;
   char mark;                    /* 0 stdout, '!' stderr, '*' event,
                                    '<' relayed input */
+  pid_t pid;                    /* shown in the tag; kill-able */
+  int  *lines;                  /* shared per-task line counter:
+                                   ++ on each completed line */
   struct basht_linebuf lb;
 } BASHT_STREAM;
 

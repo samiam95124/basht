@@ -59,12 +59,17 @@ basht_display_set_default (const BASHT_STREAM *ts)
   dirty = 1;
 }
 
+/* Tag: [name:n pid line] with the stream mark, if any, after n.
+   LINENO is the completed line's number, or the number the pending
+   bottom line will get. */
 static int
-make_tag (char *out, size_t cap, const BASHT_STREAM *ts)
+make_tag (char *out, size_t cap, const BASHT_STREAM *ts, int lineno)
 {
   if (ts->mark)
-    return snprintf (out, cap, "[%s:%d%c] ", ts->name, ts->id, ts->mark);
-  return snprintf (out, cap, "[%s:%d] ", ts->name, ts->id);
+    return snprintf (out, cap, "[%s:%d%c %ld %d] ", ts->name, ts->id,
+		     ts->mark, (long)ts->pid, lineno);
+  return snprintf (out, cap, "[%s:%d %ld %d] ", ts->name, ts->id,
+		   (long)ts->pid, lineno);
 }
 
 /* CR, as many spaces as are drawn, CR. */
@@ -91,8 +96,9 @@ erase_bottom (void)
 void
 basht_display_line (const BASHT_STREAM *ts, const char *text, size_t len)
 {
-  char out[BASHT_LINEBUF_CAP + BASHT_NAME_MAX + 32];
-  int t = make_tag (out, sizeof out, ts);
+  char out[BASHT_LINEBUF_CAP + BASHT_NAME_MAX + 64];
+  int ln = ts->lines ? ++(*ts->lines) : 0;
+  int t = make_tag (out, sizeof out, ts, ln);
 
   if (t < 0)
     return;
@@ -163,8 +169,9 @@ basht_display_sync (void)
   if (ts == 0)
     return;
 
-  char out[BASHT_LINEBUF_CAP + BASHT_NAME_MAX + 32];
-  int t = make_tag (out, sizeof out, ts);
+  char out[BASHT_LINEBUF_CAP + BASHT_NAME_MAX + 64];
+  int t = make_tag (out, sizeof out, ts,
+		    ts->lines ? *ts->lines + 1 : 0);
   if (t < 0)
     return;
   size_t off = (size_t)t;
