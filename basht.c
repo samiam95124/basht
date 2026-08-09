@@ -449,10 +449,15 @@ basht_fg_pump (pid_t pid)
 }
 
 /* The foreground wait is over: restore the terminal, drop the
-   pending-input display. */
+   pending-input display. Characters the user had typed for the job
+   that were never shipped (the job died mid-line) become type-ahead
+   for the next prompt, exactly as on a shared terminal: they are
+   pushed into readline's input queue, not discarded. */
 void
 basht_fg_end (void)
 {
+  size_t i;
+
   if (basht_active == 0)
     return;
   if (fg_raw)
@@ -461,6 +466,8 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
+  for (i = 0; i < fg_rly.lb.len; i++)
+    rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
   fg_rly.lb.len = fg_rly.lb.cur = 0;
   basht_display_stream_gone (&fg_rly);
   basht_drain ();
