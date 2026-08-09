@@ -35,8 +35,9 @@ putch (BASHT_STREAM *ts, char c)
     lb->len = lb->cur;
 }
 
-void
-basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf, size_t n)
+size_t
+basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
+		    size_t n, int *trigger)
 {
   struct basht_linebuf *lb = &ts->lb;
   size_t i;
@@ -71,6 +72,7 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf, size_t n)
 	      lb->fs = BF_CSI;
 	      lb->csi_n = 0;
 	      lb->csi_more = 0;
+	      lb->csi_priv = 0;
 	    }
 	  else if (c == ']')
 	    lb->fs = BF_OSC;
@@ -84,6 +86,8 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf, size_t n)
 	    lb->csi_n = lb->csi_n * 10 + (c - '0');
 	  else if (c == ';')
 	    lb->csi_more = 1;
+	  else if (c == '?')
+	    lb->csi_priv = 1;
 	  else if (c >= 0x40 && c <= 0x7e)
 	    {			/* final byte */
 	      size_t nn = lb->csi_n > 0 ? (size_t)lb->csi_n : 1;
@@ -116,6 +120,16 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf, size_t n)
 	      else if (c == 'X') /* erase chars in place */
 		memset (lb->data + lb->cur, ' ', nn > tail ? tail : nn);
 	      lb->fs = BF_NORMAL;
+	      /* alternate-screen enable: this task is a full-screen
+		 program; let the caller move it into a window */
+	      if (trigger && c == 'h' && lb->csi_priv
+		  && (lb->csi_n == 1049 || lb->csi_n == 1047
+		      || lb->csi_n == 47))
+		{
+		  *trigger = 1;
+		  basht_display_partial (ts);
+		  return i + 1;
+		}
 	    }
 	  /* else: other parameter/intermediate bytes, consume */
 	  break;
@@ -135,6 +149,7 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf, size_t n)
     }
   /* whoever wrote on an incomplete line last owns the bottom line */
   basht_display_partial (ts);
+  return n;
 }
 
 /* Stream EOF: a final unterminated line must not be lost. */

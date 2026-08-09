@@ -33,6 +33,7 @@ struct basht_linebuf {
   enum basht_filt_state fs;
   int    csi_n;                 /* first CSI numeric parameter    */
   int    csi_more;              /* saw ';' -- later params ignored */
+  int    csi_priv;              /* saw '?' (DEC private mode)     */
 };
 
 typedef struct basht_stream {
@@ -46,8 +47,13 @@ typedef struct basht_stream {
   struct basht_linebuf lb;
 } BASHT_STREAM;
 
-/* basht_filter.c */
-void basht_filter_bytes (BASHT_STREAM *, const unsigned char *, size_t);
+/* basht_filter.c. basht_filter_bytes consumes BUF and returns how
+   many bytes it processed -- always N unless TRIGGER is non-null
+   and a full-screen escape (alternate-screen enable) is seen, in
+   which case *TRIGGER is set and filtering stops just past the
+   sequence so the caller can move the task into a window. */
+size_t basht_filter_bytes (BASHT_STREAM *, const unsigned char *,
+                           size_t, int *trigger);
 void basht_filter_flush (BASHT_STREAM *);
 
 /* basht_display.c -- the single writer to the real terminal */
@@ -78,5 +84,8 @@ void basht_fg_end (void);       /* fg wait over: restore terminal */
 int  basht_send_input (const char *, int, const char *);
                                 /* `feed' builtin: name, instance
                                    (<=0 = sole live match), text */
+int  basht_bridge_main (const char *, const char *);
+                                /* --basht-bridge: run inside the
+                                   spawned terminal window */
 
 #endif /* _BASHT_H_ */

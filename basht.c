@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
@@ -54,6 +56,18 @@ struct basht_cap {
   pid_t pid;
   int lines;			/* per-task displayed-line counter */
   BASHT_STREAM out, err;
+  /* auto-window: a task that enables the alternate screen is moved
+     into its own terminal window, bridged over a fifo pair */
+  int    windowed;		/* output now shuttles to the window */
+  int    w_was;			/* has been windowed: the console
+				   keyboard relay stays released   */
+  int    w_out, w_in;		/* fifos: to bridge / from bridge  */
+  int    w_need_ws;		/* awaiting 4-byte winsize header  */
+  int    w_hinted;		/* windowing failed; hint printed  */
+  char   wdir[64];		/* mkdtemp dir holding the fifos   */
+  size_t nbytes;		/* total stdout bytes read         */
+  unsigned char pre[2048];	/* raw stdout prefix, for replay   */
+  size_t prelen;
 };
 static struct basht_cap caps[BASHT_MAX_CAPS];
 
@@ -139,6 +153,28 @@ cap_name (const char *command, char *out, size_t cap)
 }
 
 static void
+cap_window_close (struct basht_cap *cp)
+{
+  char path[96];
+
+  if (cp->w_out >= 0)
+    close (cp->w_out);
+  if (cp->w_in >= 0)
+    close (cp->w_in);
+  cp->w_out = cp->w_in = -1;
+  cp->windowed = 0;
+  if (cp->wdir[0])
+    {
+      snprintf (path, sizeof path, "%s/o", cp->wdir);
+      unlink (path);
+      snprintf (path, sizeof path, "%s/i", cp->wdir);
+      unlink (path);
+      rmdir (cp->wdir);
+      cp->wdir[0] = '\0';
+    }
+}
+
+static void
 cap_free (struct basht_cap *cp)
 {
   if (cp->m_in >= 0)
@@ -148,6 +184,7 @@ cap_free (struct basht_cap *cp)
   if (cp->m_err >= 0)
     close (cp->m_err);
   cp->m_in = cp->m_out = cp->m_err = -1;
+  cap_window_close (cp);
   basht_display_stream_gone (&cp->out);
   basht_display_stream_gone (&cp->err);
   cp->out.id = 0;
@@ -191,6 +228,7 @@ basht_fork_prepare (const char *command, int flags)
 
   memset (cp, 0, sizeof *cp);
   cp->pid = -1;
+  cp->w_out = cp->w_in = -1;
   cp->m_in = open_master (pend_sin, sizeof pend_sin);
   cp->m_out = open_master (pend_sout, sizeof pend_sout);
   cp->m_err = open_master (pend_serr, sizeof pend_serr);
@@ -249,7 +287,7 @@ drain_self (void)
 	break;
       n = read (self_master, buf, sizeof buf);
       if (n > 0)
-	basht_filter_bytes (&self, buf, (size_t)n);
+	basht_filter_bytes (&self, buf, (size_t)n, 0);
       else if (n < 0 && (errno == EINTR || errno == EAGAIN))
 	continue;
       else
@@ -270,7 +308,7 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
       n = read (*fd, buf, sizeof buf);
       if (n > 0)
 	{
-	  basht_filter_bytes (ts, buf, (size_t)n);
+	  basht_filter_bytes (ts, buf, (size_t)n, 0);
 	  continue;
 	}
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -284,6 +322,280 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
     }
 }
 
+static void fg_signal (pid_t, int);
+
+/* ---- auto-window: full-screen tasks move to a terminal window ---
+
+   When a task enables the alternate screen, basht stops filtering
+   it, spawns a terminal window running this same binary in
+   --basht-bridge mode, replays the task's small raw prefix (which
+   ends at the trigger sequence: detection happens at the program's
+   first breath), and from then on shuttles bytes between the
+   task's ptys and the window over a fifo pair. Bytes the task
+   writes while the window is starting simply wait in the kernel
+   pty queue -- basht stops reading, and the backed-up pty is all
+   the flow control needed. */
+
+static char self_exe[256];
+
+/* Replay the prefix minus terminal queries (CSI ... n/c): the new
+   terminal would answer them and the answers would arrive as
+   phantom keystrokes. */
+static size_t
+scrub_queries (const unsigned char *in, size_t n, unsigned char *out)
+{
+  size_t i = 0, o = 0;
+
+  while (i < n)
+    {
+      if (in[i] == 0x1b && i + 1 < n && in[i + 1] == '[')
+	{
+	  size_t j = i + 2;
+	  while (j < n && !(in[j] >= 0x40 && in[j] <= 0x7e))
+	    j++;
+	  if (j < n && (in[j] == 'n' || in[j] == 'c'))
+	    {
+	      i = j + 1;	/* drop the query */
+	      continue;
+	    }
+	  /* copy the whole sequence (or partial tail) */
+	  if (j < n)
+	    j++;
+	  memcpy (out + o, in + i, j - i);
+	  o += j - i;
+	  i = j;
+	  continue;
+	}
+      out[o++] = in[i++];
+    }
+  return o;
+}
+
+static int
+window_try (struct basht_cap *cp)
+{
+  char fo[96], fi[96];
+  char termbuf[256];
+  char *targv[16];
+  int ntargv;
+  pid_t wpid;
+  unsigned char rep[sizeof cp->pre];
+  size_t replen;
+  const char *termcmd;
+
+  if (cp->windowed || cp->pid <= 0)
+    return 0;
+  /* only at the task's first breath: prefix complete, nothing
+     displayed yet -- outside that, restarting or attaching would
+     lose state, so just hint */
+  if (cp->nbytes > sizeof cp->pre || cp->lines != 0)
+    return 0;
+  termcmd = getenv ("BASHT_TERMINAL");
+  if (termcmd == 0 || *termcmd == '\0')
+    {
+      if (getenv ("DISPLAY") == 0 && getenv ("WAYLAND_DISPLAY") == 0)
+	return 0;		/* no GUI to open a window on */
+      termcmd = "gnome-terminal --";
+    }
+
+  strcpy (cp->wdir, "/tmp/basht.XXXXXX");
+  if (mkdtemp (cp->wdir) == 0)
+    {
+      cp->wdir[0] = '\0';
+      return 0;
+    }
+  snprintf (fo, sizeof fo, "%s/o", cp->wdir);
+  snprintf (fi, sizeof fi, "%s/i", cp->wdir);
+  if (mkfifo (fo, 0600) < 0 || mkfifo (fi, 0600) < 0)
+    {
+      cap_window_close (cp);
+      return 0;
+    }
+  /* O_RDWR on the outbound fifo: never blocks at open, and since we
+     hold a reader it can never raise SIGPIPE at us; the bridge
+     still sees EOF when we close it. Inbound is a plain
+     nonblocking reader. */
+  cp->w_out = open (fo, O_RDWR | O_NONBLOCK);
+  cp->w_in = open (fi, O_RDONLY | O_NONBLOCK);
+  if (cp->w_out < 0 || cp->w_in < 0)
+    {
+      cap_window_close (cp);
+      return 0;
+    }
+  fcntl (cp->w_out, F_SETFD, FD_CLOEXEC);
+  fcntl (cp->w_in, F_SETFD, FD_CLOEXEC);
+
+  /* terminal command: split on blanks, append bridge invocation */
+  strncpy (termbuf, termcmd, sizeof termbuf - 1);
+  termbuf[sizeof termbuf - 1] = '\0';
+  ntargv = 0;
+  for (char *tok = strtok (termbuf, " \t"); tok && ntargv < 11;
+       tok = strtok (0, " \t"))
+    targv[ntargv++] = tok;
+  targv[ntargv++] = self_exe;
+  targv[ntargv++] = (char *)"--basht-bridge";
+  targv[ntargv++] = fo;
+  targv[ntargv++] = fi;
+  targv[ntargv] = 0;
+
+  wpid = fork ();
+  if (wpid < 0)
+    {
+      cap_window_close (cp);
+      return 0;
+    }
+  if (wpid == 0)
+    {
+      execvp (targv[0], targv);
+      _exit (127);
+    }
+
+  /* replay the prefix (it ends at the trigger); the window's
+     terminal interprets it natively */
+  replen = scrub_queries (cp->pre, cp->prelen, rep);
+  basht_write_all (cp->w_out, rep, replen);
+
+  cp->windowed = 1;
+  cp->w_was = 1;
+  cp->w_need_ws = 1;
+  basht_display_event (&cp->out, "full screen: moved to a window");
+  return 1;
+}
+
+/* Shuttle for a windowed task: window keyboard -> task stdin
+   (after the 4-byte winsize header), task stdout/stderr -> window,
+   gated on fifo room so a stalled window backs up into the kernel
+   pty queue instead of into basht. */
+static void
+shuttle_windowed (struct basht_cap *cp)
+{
+  unsigned char buf[2048];
+  ssize_t n;
+
+  /* keyboard and winsize from the bridge */
+  while (cp->w_in >= 0)
+    {
+      n = read (cp->w_in, buf, sizeof buf);
+      if (n > 0)
+	{
+	  unsigned char *p = buf;
+	  if (cp->w_need_ws && n >= 4)
+	    {
+	      struct winsize ws;
+	      memset (&ws, 0, sizeof ws);
+	      ws.ws_row = (buf[0] << 8) | buf[1];
+	      ws.ws_col = (buf[2] << 8) | buf[3];
+	      if (ws.ws_row > 0 && ws.ws_col > 0)
+		{
+		  ioctl (cp->m_in, TIOCSWINSZ, &ws);
+		  ioctl (cp->m_out, TIOCSWINSZ, &ws);
+		  ioctl (cp->m_err, TIOCSWINSZ, &ws);
+		  fg_signal (cp->pid, SIGWINCH);
+		}
+	      cp->w_need_ws = 0;
+	      p += 4;
+	      n -= 4;
+	    }
+	  if (n > 0 && cp->m_in >= 0)
+	    basht_write_all (cp->m_in, p, (size_t)n);
+	  continue;
+	}
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+	break;
+      if (n < 0 && errno == EINTR)
+	continue;
+      if (n == 0 && cp->w_need_ws)
+	break;			/* bridge not connected yet */
+      /* window closed: hang up the task; if it survives, its
+	 output returns to the tagged console */
+      fg_signal (cp->pid, SIGHUP);
+      cap_window_close (cp);
+      basht_display_event (&cp->out, "window closed");
+      return;
+    }
+
+  /* task output to the window, only as fast as the fifo drains */
+  for (int which = 0; which < 2; which++)
+    {
+      int *fd = which ? &cp->m_err : &cp->m_out;
+      while (*fd >= 0 && cp->w_out >= 0)
+	{
+	  fd_set wf;
+	  struct timeval tv;
+	  FD_ZERO (&wf);
+	  FD_SET (cp->w_out, &wf);
+	  tv.tv_sec = tv.tv_usec = 0;
+	  if (select (cp->w_out + 1, 0, &wf, 0, &tv) <= 0)
+	    break;		/* fifo full: kernel pty holds it */
+	  n = read (*fd, buf, sizeof buf);
+	  if (n > 0)
+	    {
+	      basht_write_all (cp->w_out, buf, (size_t)n);
+	      continue;
+	    }
+	  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+	    break;
+	  if (n < 0 && errno == EINTR)
+	    continue;
+	  close (*fd);		/* task side gone */
+	  *fd = -1;
+	}
+    }
+}
+
+/* stdout drain with full-screen detection: raw bytes are copied
+   into the replay prefix before filtering, so at the moment of
+   detection the prefix holds everything the task ever wrote,
+   trigger included. */
+static void
+drain_cap_out (struct basht_cap *cp)
+{
+  unsigned char buf[4096];
+  ssize_t n;
+
+  while (cp->m_out >= 0 && cp->windowed == 0)
+    {
+      n = read (cp->m_out, buf, sizeof buf);
+      if (n > 0)
+	{
+	  size_t done = 0;
+	  if (cp->prelen < sizeof cp->pre)
+	    {
+	      size_t k = sizeof cp->pre - cp->prelen;
+	      if (k > (size_t)n)
+		k = (size_t)n;
+	      memcpy (cp->pre + cp->prelen, buf, k);
+	      cp->prelen += k;
+	    }
+	  cp->nbytes += (size_t)n;
+	  while (done < (size_t)n)
+	    {
+	      int trig = 0;
+	      done += basht_filter_bytes (&cp->out, buf + done,
+					  (size_t)n - done, &trig);
+	      if (trig && window_try (cp))
+		return;		/* rest of chunk was in the prefix */
+	      if (trig && cp->w_hinted == 0)
+		{
+		  cp->w_hinted = 1;
+		  basht_display_event (&cp->out,
+		      "full-screen program; try: gnome-terminal -- %s",
+		      cp->out.name);
+		}
+	    }
+	  continue;
+	}
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+	return;
+      if (n < 0 && errno == EINTR)
+	continue;
+      basht_filter_flush (&cp->out);
+      close (cp->m_out);
+      cp->m_out = -1;
+      return;
+    }
+}
+
 static void
 drain_caps (void)
 {
@@ -291,11 +603,21 @@ drain_caps (void)
 
   for (i = 0; i < BASHT_MAX_CAPS; i++)
     {
-      drain_cap_fd (&caps[i].m_out, &caps[i].out);
-      drain_cap_fd (&caps[i].m_err, &caps[i].err);
+      struct basht_cap *cp = &caps[i];
+      if (cp->out.id == 0)
+	continue;
+      if (cp->windowed)
+	shuttle_windowed (cp);
+      if (cp->windowed == 0)
+	{
+	  drain_cap_out (cp);
+	  if (cp->windowed)	/* moved just now */
+	    continue;
+	  drain_cap_fd (&cp->m_err, &cp->err);
+	}
       /* both output streams gone: the task is over; release */
-      if (caps[i].m_out < 0 && caps[i].m_err < 0 && caps[i].m_in >= 0)
-	cap_free (&caps[i]);
+      if (cp->m_out < 0 && cp->m_err < 0 && cp->m_in >= 0)
+	cap_free (cp);
     }
 }
 
@@ -365,6 +687,22 @@ basht_fg_pump (pid_t pid)
 
   cp = pid > 0 ? cap_by_pid (pid) : 0;
 
+  /* a windowed (or once-windowed) foreground task gets its keyboard
+     from the window, never the console: stand down the relay
+     (typed-ahead chars become the next prompt's input as usual) */
+  if (cp && (cp->windowed || cp->w_was))
+    {
+      if (fg_raw && fg_pid == pid)
+	{
+	  tcsetattr (0, TCSANOW, &fg_tio_save);
+	  fg_raw = 0;
+	  fg_pid = -1;
+	  fg_rly.lb.len = fg_rly.lb.cur = 0;
+	  basht_display_stream_gone (&fg_rly);
+	}
+      cp = 0;
+    }
+
   /* new foreground episode with a captured job: go raw and relay */
   if (cp && cp->m_in >= 0 && fg_pid != pid)
     {
@@ -415,6 +753,12 @@ basht_fg_pump (pid_t pid)
 	  FD_SET (caps[i].m_err, &rf);
 	  if (caps[i].m_err > maxfd)
 	    maxfd = caps[i].m_err;
+	}
+      if (caps[i].windowed && caps[i].w_in >= 0)
+	{
+	  FD_SET (caps[i].w_in, &rf);
+	  if (caps[i].w_in > maxfd)
+	    maxfd = caps[i].w_in;
 	}
     }
   tv.tv_sec = 0;
@@ -573,6 +917,12 @@ basht_getc (FILE *stream)
 	      if (caps[i].m_err > maxfd)
 		maxfd = caps[i].m_err;
 	    }
+	  if (caps[i].windowed && caps[i].w_in >= 0)
+	    {
+	      FD_SET (caps[i].w_in, &rf);
+	      if (caps[i].w_in > maxfd)
+		maxfd = caps[i].w_in;
+	    }
 	}
       tv.tv_sec = 0;
       tv.tv_usec = 200000;
@@ -643,8 +993,18 @@ basht_init (void)
   for (int i = 0; i < BASHT_MAX_CAPS; i++)
     {
       caps[i].m_in = caps[i].m_out = caps[i].m_err = -1;
+      caps[i].w_out = caps[i].w_in = -1;
       caps[i].pid = -1;
     }
+
+  {
+    ssize_t k = readlink ("/proc/self/exe", self_exe,
+			  sizeof self_exe - 1);
+    if (k > 0)
+      self_exe[k] = '\0';
+    else
+      strcpy (self_exe, "bash");
+  }
 
   rl_getc_function = basht_getc;
 
@@ -689,4 +1049,87 @@ basht_child_stdio (void)
     }
   dup2 (basht_tty, 1);
   dup2 (basht_tty, 2);
+}
+
+/* ---- --basht-bridge: runs inside the spawned terminal window ----
+
+   The window is a viewport onto a task that keeps running on
+   basht's ptys. This end goes raw, reports its window size (4-byte
+   header), then shuttles: fifo from basht -> our stdout (the real
+   terminal draws it), our keyboard -> fifo to basht. Exits when
+   basht closes the outbound fifo (task ended), which closes the
+   window. */
+int
+basht_bridge_main (const char *opath, const char *ipath)
+{
+  int ofd, ifd, r;
+  struct termios save, t;
+  int have_tio;
+  struct winsize ws;
+  unsigned char hdr[4];
+  unsigned char buf[4096];
+  ssize_t n;
+
+  signal (SIGPIPE, SIG_IGN);
+  ofd = open (opath, O_RDONLY | O_NONBLOCK);
+  ifd = open (ipath, O_WRONLY);
+  if (ofd < 0 || ifd < 0)
+    return 1;
+  fcntl (ofd, F_SETFL, 0);	/* back to blocking */
+
+  have_tio = tcgetattr (0, &save) == 0;
+  if (have_tio)
+    {
+      t = save;
+      t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG | IEXTEN);
+      t.c_iflag &= ~(tcflag_t)(IXON | ICRNL);
+      t.c_cc[VMIN] = 1;
+      t.c_cc[VTIME] = 0;
+      tcsetattr (0, TCSANOW, &t);
+    }
+
+  memset (&ws, 0, sizeof ws);
+  if (ioctl (0, TIOCGWINSZ, &ws) < 0 || ws.ws_row == 0)
+    {
+      ws.ws_row = 24;
+      ws.ws_col = 80;
+    }
+  hdr[0] = ws.ws_row >> 8;
+  hdr[1] = ws.ws_row & 0xff;
+  hdr[2] = ws.ws_col >> 8;
+  hdr[3] = ws.ws_col & 0xff;
+  basht_write_all (ifd, hdr, 4);
+
+  for (;;)
+    {
+      fd_set rf;
+      FD_ZERO (&rf);
+      FD_SET (0, &rf);
+      FD_SET (ofd, &rf);
+      r = select (ofd + 1, &rf, 0, 0, 0);
+      if (r < 0)
+	{
+	  if (errno == EINTR)
+	    continue;
+	  break;
+	}
+      if (FD_ISSET (ofd, &rf))
+	{
+	  n = read (ofd, buf, sizeof buf);
+	  if (n <= 0)
+	    break;		/* task over: close the window */
+	  basht_write_all (1, buf, (size_t)n);
+	}
+      if (FD_ISSET (0, &rf))
+	{
+	  n = read (0, buf, sizeof buf);
+	  if (n <= 0)
+	    break;
+	  basht_write_all (ifd, buf, (size_t)n);
+	}
+    }
+
+  if (have_tio)
+    tcsetattr (0, TCSANOW, &save);
+  return 0;
 }

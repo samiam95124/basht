@@ -387,6 +387,14 @@ main (int argc, char **argv, char **env)
   env = environ;
 #endif /* __OPENNT || __MVS__ */
 
+  /* basht: when spawned inside a terminal window as the bridge for
+     a full-screen task, we are not a shell at all. */
+  if (argc >= 4 && strcmp (argv[1], "--basht-bridge") == 0)
+    {
+      extern int basht_bridge_main (const char *, const char *);
+      exit (basht_bridge_main (argv[2], argv[3]));
+    }
+
   USE_VAR(argc);
   USE_VAR(argv);
   USE_VAR(env);
