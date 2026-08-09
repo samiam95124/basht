@@ -2294,6 +2294,13 @@ make_child (char *command, int flags)
   async_p = (flags & FORK_ASYNC);
   forksleep = 1;
 
+  /* basht: async job-table children get capture ptys (allocated
+     pre-fork; the child attaches the slaves in basht_child_stdio) */
+  {
+    extern void basht_fork_prepare (const char *, int);
+    basht_fork_prepare (command, flags);
+  }
+
   /* If default_buffered_input is active, we are reading a script.  If
      the command is asynchronous, we have already duplicated /dev/null
      as fd 0, but have not changed the buffered stream corresponding to
@@ -2325,6 +2332,13 @@ make_child (char *command, int flags)
   if (pid != 0)
     if (interactive_shell)
       set_signal_handler (SIGTERM, oterm);
+
+  /* basht: commit (pid > 0) or free (pid < 0) the pending capture;
+     no-op in the child, which consumes it in basht_child_stdio. */
+  {
+    extern void basht_fork_done (pid_t);
+    basht_fork_done (pid);
+  }
 
   if (pid < 0)
     {

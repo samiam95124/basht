@@ -63,8 +63,10 @@ void basht_init (void);         /* interactive shells only; safe to
                                    call when not applicable */
 void basht_drain (void);        /* poll+drain+sync; never blocks */
 void basht_command_begin (void); /* echo accepted line, drop prompt */
-void basht_child_stdio (void);  /* forked child: restore real tty on
-                                   fds 1/2 (phase 1: children are
-                                   not yet pty-captured) */
+void basht_child_stdio (void);  /* forked child: attach capture ptys
+                                   (async jobs) or restore the real
+                                   tty on fds 1/2 */
+void basht_fork_prepare (const char *, int); /* parent, pre-fork  */
+void basht_fork_done (pid_t);                /* parent, post-fork */
 
 #endif /* _BASHT_H_ */

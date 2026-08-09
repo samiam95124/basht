@@ -28,6 +28,7 @@
 
 #include "bashtypes.h"
 #include "shell.h"
+#include "jobs.h"		/* FORK_* flags */
 
 #include <readline/readline.h>
 
@@ -38,6 +39,148 @@ int basht_tty = -1;
 
 static BASHT_STREAM self;	/* task 0 */
 static int self_master = -1;	/* master side of task 0's pty */
+
+/* Phase 2: captured background tasks. Each async top-level child
+   gets an out pty and an err pty; the masters are drained here and
+   displayed as tagged lines. Pipes and redirections applied after
+   fork override the slaves, so only terminal-bound streams are
+   captured. */
+#define BASHT_MAX_CAPS 64
+
+struct basht_cap {
+  int m_out, m_err;		/* master fds; -1 = closed */
+  BASHT_STREAM out, err;
+};
+static struct basht_cap caps[BASHT_MAX_CAPS];
+static int next_task_id = 1;
+
+/* pending capture between basht_fork_prepare() and the fork */
+static int  pend_slot = -1;
+static char pend_sout[64], pend_serr[64];
+
+static int
+open_master (char *sname, size_t cap)
+{
+  int m;
+  char *p;
+
+  m = posix_openpt (O_RDWR | O_NOCTTY);
+  if (m < 0)
+    return -1;
+  if (grantpt (m) < 0 || unlockpt (m) < 0 || (p = ptsname (m)) == 0)
+    {
+      close (m);
+      return -1;
+    }
+  strncpy (sname, p, cap - 1);
+  sname[cap - 1] = '\0';
+  fcntl (m, F_SETFD, FD_CLOEXEC);
+  fcntl (m, F_SETFL, O_NONBLOCK);
+  return m;
+}
+
+/* basename of the first word of COMMAND, for the tag */
+static void
+cap_name (const char *command, char *out, size_t cap)
+{
+  const char *p, *e, *b, *q;
+  size_t n;
+
+  p = command ? command : "";
+  while (*p == ' ' || *p == '\t')
+    p++;
+  for (e = p; *e && *e != ' ' && *e != '\t'; e++)
+    ;
+  b = p;
+  for (q = p; q < e; q++)
+    if (*q == '/')
+      b = q + 1;
+  n = (size_t)(e - b);
+  if (n == 0)
+    {
+      strncpy (out, "job", cap);
+      out[cap - 1] = '\0';
+      return;
+    }
+  if (n > cap - 1)
+    n = cap - 1;
+  memcpy (out, b, n);
+  out[n] = '\0';
+}
+
+static void
+cap_free (struct basht_cap *cp)
+{
+  if (cp->m_out >= 0)
+    close (cp->m_out);
+  if (cp->m_err >= 0)
+    close (cp->m_err);
+  cp->m_out = cp->m_err = -1;
+  basht_display_stream_gone (&cp->out);
+  basht_display_stream_gone (&cp->err);
+  cp->out.id = 0;
+}
+
+/* Called in the parent just before fork. Decides whether this child
+   is captured and allocates its ptys. Only async, job-table,
+   interactive children qualify (no comsub/procsub). */
+void
+basht_fork_prepare (const char *command, int flags)
+{
+  int i;
+  struct basht_cap *cp;
+
+  if (pend_slot >= 0)		/* stale (fork never completed) */
+    {
+      cap_free (&caps[pend_slot]);
+      pend_slot = -1;
+    }
+  if (basht_active == 0 || (flags & FORK_ASYNC) == 0
+      || (flags & (FORK_COMSUB | FORK_PROCSUB)))
+    return;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    if (caps[i].m_out < 0 && caps[i].m_err < 0)
+      break;
+  if (i == BASHT_MAX_CAPS)
+    return;			/* table full: run uncaptured */
+  cp = &caps[i];
+
+  memset (cp, 0, sizeof *cp);
+  cp->m_out = open_master (pend_sout, sizeof pend_sout);
+  if (cp->m_out < 0)
+    {
+      cp->m_out = cp->m_err = -1;
+      return;
+    }
+  cp->m_err = open_master (pend_serr, sizeof pend_serr);
+  if (cp->m_err < 0)
+    {
+      close (cp->m_out);
+      cp->m_out = cp->m_err = -1;
+      return;
+    }
+
+  cap_name (command, cp->out.name, sizeof cp->out.name);
+  strcpy (cp->err.name, cp->out.name);
+  cp->out.id = cp->err.id = next_task_id++;
+  cp->out.mark = 0;
+  cp->err.mark = '!';
+  pend_slot = i;
+}
+
+/* Called in the parent right after fork. PID < 0: fork failed, free
+   the pending capture. PID > 0: capture is live. (In the child this
+   is not called; basht_child_stdio consumes the pending state.) */
+void
+basht_fork_done (pid_t pid)
+{
+  if (pend_slot < 0 || pid == 0)
+    return;
+  if (pid < 0)
+    cap_free (&caps[pend_slot]);
+  pend_slot = -1;
+}
 
 /* Read whatever the task-0 master has. Returns only when the pty is
    momentarily empty. */
@@ -67,6 +210,45 @@ drain_self (void)
     }
 }
 
+/* Drain one capture master (non-blocking). EOF/EIO means the child
+   side is gone: flush the partial line and close. */
+static void
+drain_cap_fd (int *fd, BASHT_STREAM *ts)
+{
+  unsigned char buf[4096];
+  ssize_t n;
+
+  while (*fd >= 0)
+    {
+      n = read (*fd, buf, sizeof buf);
+      if (n > 0)
+	{
+	  basht_filter_bytes (ts, buf, (size_t)n);
+	  continue;
+	}
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+	return;
+      if (n < 0 && errno == EINTR)
+	continue;
+      basht_filter_flush (ts);	/* EOF or EIO */
+      close (*fd);
+      *fd = -1;
+      return;
+    }
+}
+
+static void
+drain_caps (void)
+{
+  int i;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      drain_cap_fd (&caps[i].m_out, &caps[i].out);
+      drain_cap_fd (&caps[i].m_err, &caps[i].err);
+    }
+}
+
 void
 basht_drain (void)
 {
@@ -75,6 +257,7 @@ basht_drain (void)
   fflush (stdout);
   fflush (stderr);
   drain_self ();
+  drain_caps ();
   basht_display_sync ();
 }
 
@@ -119,6 +302,21 @@ basht_getc (FILE *stream)
 	  FD_SET (self_master, &rf);
 	  if (self_master > maxfd)
 	    maxfd = self_master;
+	}
+      for (int i = 0; i < BASHT_MAX_CAPS; i++)
+	{
+	  if (caps[i].m_out >= 0)
+	    {
+	      FD_SET (caps[i].m_out, &rf);
+	      if (caps[i].m_out > maxfd)
+		maxfd = caps[i].m_out;
+	    }
+	  if (caps[i].m_err >= 0)
+	    {
+	      FD_SET (caps[i].m_err, &rf);
+	      if (caps[i].m_err > maxfd)
+		maxfd = caps[i].m_err;
+	    }
 	}
       tv.tv_sec = 0;
       tv.tv_usec = 200000;
@@ -181,6 +379,9 @@ basht_init (void)
   self.id = 0;
   basht_display_set_default (&self);
 
+  for (int i = 0; i < BASHT_MAX_CAPS; i++)
+    caps[i].m_out = caps[i].m_err = -1;
+
   rl_getc_function = basht_getc;
 
   basht_active = 1;
@@ -195,6 +396,27 @@ basht_child_stdio (void)
 {
   if (basht_active == 0 || basht_tty < 0)
     return;
+  if (pend_slot >= 0)
+    {
+      /* captured child: attach this task's pty slaves */
+      int o = open (pend_sout, O_RDWR | O_NOCTTY);
+      int e = open (pend_serr, O_RDWR | O_NOCTTY);
+      if (o >= 0 && e >= 0)
+	{
+	  dup2 (o, 1);
+	  dup2 (e, 2);
+	  if (o > 2)
+	    close (o);
+	  if (e > 2)
+	    close (e);
+	  return;
+	}
+      if (o >= 0)
+	close (o);
+      if (e >= 0)
+	close (e);
+      /* fall through: run on the real terminal */
+    }
   dup2 (basht_tty, 1);
   dup2 (basht_tty, 2);
 }
