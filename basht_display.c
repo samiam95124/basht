@@ -59,16 +59,16 @@ basht_display_set_default (const BASHT_STREAM *ts)
   dirty = 1;
 }
 
-/* Tag: [name:n pid line] with the stream mark, if any, after n.
+/* Tag: [name:n:pid:line] with the stream mark, if any, after n.
    LINENO is the completed line's number, or the number the pending
    bottom line will get. */
 static int
 make_tag (char *out, size_t cap, const BASHT_STREAM *ts, int lineno)
 {
   if (ts->mark)
-    return snprintf (out, cap, "[%s:%d%c %ld %d] ", ts->name, ts->id,
+    return snprintf (out, cap, "[%s:%d%c:%ld:%d] ", ts->name, ts->id,
 		     ts->mark, (long)ts->pid, lineno);
-  return snprintf (out, cap, "[%s:%d %ld %d] ", ts->name, ts->id,
+  return snprintf (out, cap, "[%s:%d:%ld:%d] ", ts->name, ts->id,
 		   (long)ts->pid, lineno);
 }
 
