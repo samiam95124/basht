@@ -3938,10 +3938,14 @@ initialize_bash_input (void)
 
 /* Set the contents of the current bash input stream from
    GET, UNGET, TYPE, NAME, and LOCATION. */
+/* Universal line-ending recognizer state (see yy_getc below). */
+static int yy_le_cr, yy_le_lf;
+
 void
 init_yy_io (sh_cget_func_t *get, sh_cunget_func_t *unget, enum stream_type type, const char *name, INPUT_STREAM location)
 {
   bash_input.type = type;
+  yy_le_cr = yy_le_lf = 0; /* new stream: reset line-ending state */
   FREE (bash_input.name);
   bash_input.name = name ? savestring (name) : (char *)NULL;
 
@@ -3961,18 +3965,49 @@ yy_input_name (void)
   return (bash_input.name ? bash_input.name : "stdin");
 }
 
-/* Call this to get the next character of input. */
+/* Call this to get the next character of input.
+
+   Universal line ending recognizer (after flip.c, Pascal-P6): any of
+   cr lf, lf cr, bare cr, or bare lf is one line ending, and is read
+   as a single '\n'. This makes the shell tolerant of DOS, old-Mac
+   and Unix encoded input alike, from every input source (script
+   files, -c strings, sourced files, here-documents). The pair state
+   is cleared by any other character, so the two halves of a pair
+   never match across intervening text. State lives in yy_le_cr /
+   yy_le_lf, declared above init_yy_io, which resets it per stream. */
 static int
 yy_getc (void)
 {
-#ifndef __MSYS__
-  return (*(bash_input.getter)) ();
-#else
   int c;
-  /* skip \r entirely on MSYS */
-  while ((c = (*(bash_input.getter)) ()) == '\r');
-  return c;
-#endif
+
+  for (;;)
+    {
+      c = (*(bash_input.getter)) ();
+      if (c == '\n')
+	{
+	  if (yy_le_cr)
+	    {
+	      /* tail of a cr lf pair: swallow it */
+	      yy_le_cr = yy_le_lf = 0;
+	      continue;
+	    }
+	  yy_le_lf = 1;
+	  return '\n';
+	}
+      else if (c == '\r')
+	{
+	  if (yy_le_lf)
+	    {
+	      /* tail of an lf cr pair: swallow it */
+	      yy_le_cr = yy_le_lf = 0;
+	      continue;
+	    }
+	  yy_le_cr = 1;
+	  return '\n';
+	}
+      yy_le_cr = yy_le_lf = 0;
+      return c;
+    }
 }
 
 /* Call this to unget C.  That is, to make C the next character
