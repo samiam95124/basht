@@ -4,7 +4,7 @@
 #
 # The bug address depends on the release status of the shell.  Versions
 # with status `devel', `alpha', `beta', or `rc' mail bug reports to
-# chet.ramey@case.edu and, optionally, to bash-testers@cwru.edu.
+# chet@cwru.edu and, optionally, to bash-testers@cwru.edu.
 # Other versions send mail to bug-bash@gnu.org.
 #
 # Copyright (C) 1996-2021 Free Software Foundation, Inc.
@@ -26,14 +26,14 @@
 # configuration section:
 #	these variables are filled in by the make target in Makefile
 #
-MACHINE="x86_64"
-OS="linux-gnu"
-CC="gcc"
-CFLAGS="-g -O2"
-RELEASE="5.3"
+MACHINE="!MACHINE!"
+OS="!OS!"
+CC="!CC!"
+CFLAGS="!CFLAGS!"
+RELEASE="!RELEASE!"
 PATCHLEVEL="!PATCHLEVEL!"
-RELSTATUS="release"
-MACHTYPE="x86_64-pc-linux-gnu"
+RELSTATUS="!RELSTATUS!"
+MACHTYPE="!MACHTYPE!"
 
 PATH=/bin:/usr/bin:/usr/local/bin:$PATH
 export PATH
@@ -102,7 +102,7 @@ esac
 BASHTESTERS="bash-testers@cwru.edu"
 
 case "$RELSTATUS" in
-alpha*|beta*|devel*|rc*)	BUGBASH=chet.ramey@case.edu ;;
+alpha*|beta*|devel*|rc*)	BUGBASH=chet@cwru.edu ;;
 *)				BUGBASH=bug-bash@gnu.org ;;
 esac
 
@@ -132,10 +132,6 @@ if [ -z "$DEFEDITOR" ] && [ -z "$EDITOR" ]; then
 		DEFEDITOR=emacs
 	elif [ -x /usr/bin/xemacs ]; then
 		DEFEDITOR=xemacs
-	elif [ -x /usr/bin/vim ]; then
-		DEFEDITOR=vim
-	elif [ -x /usr/bin/gvim ]; then
-		DEFEDITOR=gvim
 	elif [ -x /usr/bin/nano ]; then
 		DEFEDITOR=nano
 	elif [ -x /usr/contrib/bin/jove ]; then

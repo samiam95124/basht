@@ -65,7 +65,6 @@ po/stamp-po
 
 support/bash.pc
 support/man2html
-support/bashbug.sh
 
 lsignames.h
 pathnames.h
@@ -118,3 +117,8 @@ examples/loadables/tty
 examples/loadables/uname
 examples/loadables/unlink
 examples/loadables/whoami
+make.log
+configure.log
+buildconf.h
+stdckdint.h
+examples/loadables/Makefile.sample
