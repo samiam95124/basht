@@ -1715,6 +1715,13 @@ yy_readline_get (void)
       current_readline_line = readline (current_readline_prompt ?
       					  current_readline_prompt : "");
 
+      /* basht: display the accepted line's echo, then hand the
+	 console to the command (serial semantics). */
+      {
+	extern void basht_command_begin (void);
+	basht_command_begin ();
+      }
+
       CHECK_TERMSIG;
       if (signal_is_ignored (SIGINT) == 0)
 	{

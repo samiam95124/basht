@@ -830,6 +830,14 @@ main (int argc, char **argv, char **env)
   if (pretty_print_mode)
     exit_shell (pretty_print_loop ());
 
+  /* basht: bring up the multiplexed tagged display (task 0) for
+     interactive shells. No-op otherwise; degrades to stock output
+     if pty setup fails. */
+  {
+    extern void basht_init (void);
+    basht_init ();
+  }
+
   /* Read commands until exit condition. */
   reader_loop ();
   exit_shell (last_command_exit_value);

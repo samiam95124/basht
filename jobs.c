@@ -2347,6 +2347,14 @@ make_child (char *command, int flags)
 	 signals to the default state for a new process. */
       pid_t mypid;
 
+      /* basht phase 1: children keep the real terminal; only the
+	 shell's own output is multiplexed. Piping/redirections are
+	 applied later by the caller and override this. */
+      {
+	extern void basht_child_stdio (void);
+	basht_child_stdio ();
+      }
+
       subshell_environment |= SUBSHELL_IGNTRAP;
 
       /* If this ends up being changed to modify or use `command' in the

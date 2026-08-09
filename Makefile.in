@@ -484,7 +484,8 @@ CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
 	   input.c bashhist.c array.c arrayfunc.c assoc.c sig.c pathexp.c \
 	   unwind_prot.c siglist.c bashline.c bracecomp.c error.c \
 	   list.c stringlib.c locale.c findcmd.c redir.c \
-	   pcomplete.c pcomplib.c syntax.c xmalloc.c
+	   pcomplete.c pcomplib.c syntax.c xmalloc.c \
+	   basht.c basht_filter.c basht_display.c
 
 HSOURCES = shell.h flags.h trap.h hashcmd.h hashlib.h jobs.h builtins.h \
 	   general.h variables.h config.h $(ALLOC_HEADERS) alias.h \
@@ -532,7 +533,8 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o \
 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
-	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O)
+	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O) \
+	   basht.o basht_filter.o basht_display.o
 
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
