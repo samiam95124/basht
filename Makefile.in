@@ -113,7 +113,7 @@ OBJEXT = @OBJEXT@
 VERSPROG = bashversion$(EXEEXT)
 VERSOBJ = bashversion.$(OBJEXT)
 
-Program = bash$(EXEEXT)
+Program = basht$(EXEEXT)
 Version = @BASHVERS@
 PatchLevel = `$(BUILD_DIR)/$(VERSPROG) -p`
 RELSTATUS = @RELSTATUS@

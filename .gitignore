@@ -25,6 +25,7 @@ configure~
 autom4te.cache
 
 bash
+basht
 bashbug
 bashversion
 
