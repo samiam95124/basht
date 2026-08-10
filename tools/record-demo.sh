@@ -20,6 +20,9 @@
 #   --mic NAME    pulseaudio source name   (default: default source;
 #                 list with: pactl list short sources)
 #   --no-audio    no microphone track
+#   --aoffset S   shift audio by S seconds relative to video, to fix
+#                 lip sync: sound arriving LATE wants a negative
+#                 value (try -0.3 .. -0.8); sound early, positive
 #   --fps N       capture framerate        (default 30)
 #   --outw N      scale the video to N pixels wide (default 1920
 #                 when the region is wider than that; use the
@@ -44,6 +47,7 @@ fps=30
 duration=""
 outw=""
 cpu=0
+aoffset=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -51,6 +55,7 @@ while [ $# -gt 0 ]; do
         --camw)     camw="$2"; shift 2 ;;
         --mic)      mic="$2"; shift 2 ;;
         --no-audio) audio=0; shift ;;
+        --aoffset)  aoffset="$2"; shift 2 ;;
         --fps)      fps="$2"; shift 2 ;;
         --outw)     outw="$2"; shift 2 ;;
         --cpu)      cpu=1; shift ;;
@@ -199,7 +204,7 @@ args=(
         -i "$cam"
 )
 if [ $audio -eq 1 ]; then
-    args+=( -thread_queue_size 512 -f pulse -i "$mic" )
+    args+=( -thread_queue_size 512 -itsoffset "$aoffset" -f pulse -i "$mic" )
 fi
 if [ "$scaled_w" -lt "$W" ]; then
     mainsrc="[0:v]scale=${scaled_w}:-2[scr];"
