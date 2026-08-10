@@ -1,0 +1,278 @@
+================================================================================
+
+                        basht -- THEORY OF OPERATION
+
+          bash adapted to the line-multiplexed tagged display model
+
+================================================================================
+
+1. THE PROBLEM AND THE MODEL
+
+In a conventional Unix terminal session, every process that inherits the
+terminal writes to it directly. Output from concurrent processes interleaves
+at the character level into one merged, unattributed stream, and background
+output corrupts the line the user is typing. The terminal multiplexes
+nothing; it merely arbitrates by arrival order.
+
+basht implements the line-multiplexed model (per the Univac / OS/Z design,
+specified in tsh_spec.md and prototyped in mtsh): no task ever writes to the
+real terminal. Every task -- including the shell itself -- writes to
+pseudoterminals owned by the shell. The kernel therefore enforces output
+attribution: the shell always knows which task produced which bytes, because
+they arrive on that task's pty. Output is displayed in whole lines, each
+prefixed with an identity tag, and the bottom line of the console is managed
+so that completed lines "print through" whatever is being typed.
+
+The result: any number of tasks produce output concurrently while the user
+types at a stable prompt, every line on screen says which task it came from,
+which process to kill, and where it falls in that task's output.
+
+2. THE TAG
+
+Every displayed line carries the prefix
+
+        [name:n:pid:line]
+
+  name    basename of the first word of the task's command
+  n       instance number of that name, counting from 1 per session
+          ([hello:2] is the second hello started this session; instance
+          counts never reset, so a tag denotes the same task forever)
+  pid     process id -- directly kill-able
+  line    the task's line counter, from 1, shared across the task's
+          stdout, stderr and relayed input, giving the total order of
+          that task's console traffic
+
+A mark after n distinguishes streams:  none = stdout,  ! = stderr,
+* = shell events about the task,  < = input relayed to the task.
+The shell itself is task 0: its own output is tagged [bash:0:pid:line],
+and the visible prompt is task 0's pending (bottom) line.
+
+3. ARCHITECTURE
+
+Three new modules, lifted from the mtsh prototype, plus small insertions
+at bash's natural choke points:
+
+  basht_filter.c   stage 1: escape stripping; stage 2: line assembly
+                   run as a one-line terminal per stream
+  basht_display.c  the single writer to the real terminal; bottom-line
+                   ownership and print-through
+  basht.c          task 0 setup, the capture table, drain loops, the
+                   foreground pump, auto-windowing, the window bridge
+
+Insertions:
+
+  shell.c          basht_init() before the interactive reader loop;
+                   --basht-bridge dispatch at the top of main()
+  jobs.c           make_child(): pty allocation around the one fork
+                   point; wait_for(): the pump replaces the blocking
+                   wait; give_terminal_to(): neutralized
+  parse.y/y.tab.c  after readline accepts a line: display its echo,
+                   hand the console to the command
+  builtins/feed.def  the `feed' builtin
+
+Footprint (vs. upstream bash-5.3, as of the initial complete
+implementation): 11 files, +1887/-21 lines. The division is the
+architectural point -- about 1700 of those lines are the new
+self-contained modules, while the surgery on bash itself is small
+and shallow:
+
+  basht.c                    +1135        new
+  basht_display.c             +197        new
+  basht_filter.c              +163        new
+  builtins/feed.def           +126        new
+  basht.h                      +91        new
+  parse.y / y.tab.c        +50/-8 each    line endings; accept hook
+  jobs.c                    +48/-1        fork, wait, terminal
+  shell.c                     +16         init, bridge dispatch
+  Makefile.in (both)        +11/-4        wiring
+
+Only 21 lines of existing bash code are deleted. The model attaches
+at choke points bash already had -- one fork site, one wait loop,
+one parser character source, one readline hook -- which is why the
+adaptation stays this contained.
+
+4. TASK 0: THE SHELL IS NOT SPECIAL
+
+At interactive startup, basht_init() dups the real terminal to a private
+fd -- from then on the ONLY fd anything writes the screen through -- and
+allocates a pty whose slave replaces the shell's own stdout and stderr.
+Everything the shell prints (readline's prompt and echo, builtin output,
+error messages, job notifications) flows into that pty, through the same
+filter as any task's output, and appears as tagged [bash:0] lines. The
+prompt the user sees is nothing but task 0's incomplete line, drawn by
+the display layer. There is no privileged path from the shell to the
+screen; the uniformity is the design.
+
+5. TASK CAPTURE
+
+All job children pass through one fork point, make_child() in jobs.c.
+Before the fork, basht allocates three ptys (in, out, err) and records
+them in a capture slot; after the fork, the child attaches the slaves as
+its default fds 0/1/2. Bash then applies piping and redirections AS
+USUAL, which override those defaults -- so the internal legs of a
+pipeline, command substitution output, and explicitly redirected streams
+are never captured. Only bytes that would have reached the terminal
+enter the multiplexer. Command and process substitution forks are
+excluded outright (FORK_COMSUB/FORK_PROCSUB); non-interactive shells
+never activate any of this.
+
+The out/err ptys exist (rather than pipes) so that isatty() is true in
+the child and stdio remains line-buffered. This property is load-bearing;
+pipes would batch output into 4KB blocks and destroy liveness.
+
+Children are NOT given a new session and do not own any terminal:
+give_terminal_to() is a no-op under basht. Bash's existing process-group
+machinery still places each pipeline in its own pgrp, and that is the
+signal-delivery handle (section 9).
+
+6. THE FILTER: A ONE-LINE TERMINAL PER STREAM
+
+Each stream owns a line buffer with a cursor, run as a tiny terminal:
+
+  interpreted   \r (cursor to column 0), \b (cursor left), printable
+                bytes overwrite at the cursor, CSI K/C/D/G/P/@/X
+                (erase-to-end, right, left, column, delete, insert,
+                erase-in-place)
+  stripped      all other escape sequences (SGR color, OSC titles,
+                cursor addressing, modes) and control bytes
+  structural    \n completes the line: it is handed to the display and
+                the buffer resets; stream EOF flushes a final
+                unterminated line so nothing is lost
+
+Filter state lives in the buffer, so sequences split across read()
+boundaries never leak fragments. The interpretation subset is exactly
+what line-rewriting programs use -- readline's own echo and editing,
+progress bars, spinners -- so those reconstruct correctly; everything
+two-dimensional is deleted (or triggers windowing, section 10).
+
+Because readline's output is itself routed into task 0's pty, the entry
+line is reconstructed from readline's byte stream by this same emulator.
+The shell does not tell the display what the prompt looks like; the
+display watched it being typed.
+
+7. THE DISPLAY: BOTTOM-LINE OWNERSHIP
+
+The display layer is the only code that writes the real terminal, and it
+manages exactly one piece of state: the bottom line, owned by whichever
+stream last wrote a character on an incomplete line. When any stream
+completes a line:
+
+  1. the bottom line is erased (CR, as many spaces as drawn, CR),
+  2. the tagged completed line is written, scrolling the screen,
+  3. the owner's partial line is redrawn beneath, undisturbed.
+
+When no stream owns the bottom line, the default owner -- task 0 -- is
+drawn: that is the prompt. During a foreground command the default is
+suspended (serial semantics: the console belongs to the command), so no
+prompt is painted until the shell actually has the keyboard again. The
+terminal cursor is parked at the owning stream's cursor column, so
+mid-line editing looks right.
+
+8. THE EVENT LOOP
+
+Two phases, neither of which ever blocks the multiplexer:
+
+Prompt phase. readline's character source (rl_getc_function) is replaced
+with a select() over the keyboard, task 0's master, and every capture
+master. Output drains and displays the moment it lands in a pty; the
+keyboard wakes readline per keystroke. (rl_event_hook was rejected: its
+wait loop spins forever at EOF on non-tty stdin.) After readline accepts
+a line, the accepted line's echo is drained and displayed BEFORE the
+command runs, so the transcript reads in causal order.
+
+Foreground phase. wait_for()'s blocking waitpid becomes a pump: select
+over the keyboard and all masters, drain and display everything, relay
+the keyboard to the foreground task (section 9), reap with WNOHANG.
+Background tasks keep printing through while a foreground task runs; the
+`wait' builtin and command substitution waits pump too, so nothing
+stalls the display.
+
+9. INPUT ROUTING AND SIGNALS
+
+Serial foreground: a command run without & takes the console. The
+terminal goes raw; typed characters build the task's pending input line,
+displayed as [name:n<] and erased/redrawn through print-throughs like
+any partial line; Enter completes it, displays it, and ships it to the
+task's in-pty. ^C and ^Z are delivered as killpg(SIGINT/SIGTSTP) on the
+task's process group -- terminal ownership never moves, so there is
+nothing to take back afterward. ^D writes VEOF. If the task dies
+mid-line, the un-shipped characters are pushed into readline's queue as
+type-ahead for the next prompt, exactly as a shared terminal would have
+preserved them.
+
+Background input: `feed name[:n] text...' writes one line to a task's
+stdin without foregrounding it, addressed by tag (the :n may be omitted
+when unique; an ambiguous name is an error, not a guess). The name is
+`feed' because `in', the tsh spec's name, is a bash reserved word.
+
+10. FULL-SCREEN TASKS: THE WINDOW ESCAPE
+
+basht is for line-oriented commands; a vim is meaningless as lines. When
+a captured task enables the alternate screen (CSI ?1049h / ?1047h /
+?47h -- the one reliable announcement of a full-screen program, emitted
+in its first breath), basht:
+
+  1. stops filtering that task mid-chunk. Its raw prefix buffer (2KB,
+     accumulated from byte zero) holds everything it ever wrote,
+     trigger included. Detection is only honored inside that window --
+     no lines displayed yet, prefix complete -- so nothing is lost.
+  2. stops reading its masters. The task keeps writing into the kernel
+     pty queue and, if it outruns it, blocks in write(): the backed-up
+     pty is the whole flow-control mechanism. No shell-side buffering.
+  3. spawns $BASHT_TERMINAL (default "gnome-terminal --") running this
+     same binary as `--basht-bridge out-fifo in-fifo'. The bridge goes
+     raw, reports its window size (4-byte header), and shuttles bytes.
+  4. replays the prefix into the window -- minus terminal queries
+     (CSI...n/c), whose late answers would arrive as phantom
+     keystrokes -- then shuttles live: task output to the window, gated
+     on fifo room so a stalled window backs up into the kernel, window
+     keystrokes to the task's stdin.
+  5. applies the reported window size to the task's ptys (TIOCSWINSZ)
+     and sends SIGWINCH, so the program lays out for the real window.
+
+Closing the window hangs up the task (SIGHUP). A windowed task's
+console keyboard relay is permanently released; console typing during
+and after the window belongs to the shell. Without a GUI, or if the
+spawn fails, basht prints a tagged hint and strips escapes as before.
+`clear' and colored output never trigger any of this -- only the
+alternate screen does.
+
+11. LINE-ENDING TOLERANCE
+
+Independently of the display model, the parser's character source
+(yy_getc) runs the universal line-ending recognizer (after flip.c,
+Pascal-P6): any of cr lf, lf cr, bare cr, bare lf is one line ending,
+read as a single newline, from every input source -- script files, -c
+strings, sourced files, here-documents. Pair state is cleared by any
+other character and reset per input stream. CR as data ($'\r', read,
+command output) is untouched. DOS and old-Mac encoded scripts run
+identically to Unix ones.
+
+12. WHAT IS DEFERRED OR ACCEPTED
+
+  - Window resize after attach is not propagated (size is taken once).
+  - Pipeline stdin relay goes to the pipeline's last process.
+  - Task instance ids are not bash's [n] job numbers.
+  - A task's /dev/tty still names the real terminal (option B signal
+    design); programs that insist on /dev/tty for passwords will fight
+    the shell for the keyboard.
+  - Very long entry lines wrap onto a second screen row and the
+    single-row erase cannot clean them.
+  - A trap longjmp out of wait_for can leak raw mode (prototype risk).
+
+13. BUILD NOTES
+
+The tree is bash (savannah devel) on branch `basht', configured with
+--enable-static-link; the top-level `make basht' recurses and copies the
+static binary out as ./basht. The in-tree y.tab.c was generated by
+bison >= 3.6 and the grammar does not build with bison 3.5: never let
+make regenerate it -- hand-sync any parse.y change into y.tab.c and
+touch y.tab.c, y.tab.h and parser-built (also after every configure).
+After editing a builtins/*.def, run `make -C builtins <name>.o &&
+make -C builtins libbuiltins.a && make'; the top-level make will not.
+
+The mtsh prototype in the parent repository remains the living spec for
+display and filter behavior; when in doubt, basht reproduces mtsh's
+observable output.
+
+================================================================================
