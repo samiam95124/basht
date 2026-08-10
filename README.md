@@ -6,9 +6,10 @@ pseudoterminals; output reaches the screen as whole lines, each tagged with
 who wrote it; and background tasks print *through* the prompt while the line
 you are typing survives untouched at the bottom of the screen.
 
-![basht demo](media/demo-preview.gif)
+[![basht demo — click to watch with narration](media/demo-preview.gif)](https://youtu.be/39vmkKxlKRk)
 
-**[▶ Watch the full demo with narration (9 min, mp4)](https://github.com/samiam95124/basht/releases/download/v0.1/basht-demo.mp4)**
+**[▶ Watch the full demo with narration (9 min, YouTube)](https://youtu.be/39vmkKxlKRk)**
+&nbsp;·&nbsp; [raw mp4](https://github.com/samiam95124/basht/releases/download/v0.1/basht-demo.mp4)
 
 ```
 [bash:0:2652461:3] $ test/hello 300 30 &
