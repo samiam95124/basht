@@ -59,7 +59,7 @@ Standard bash build:
 
 ```
 ./configure && make          # add --enable-static-link for a static binary
-./bash                       # an interactive shell brings up the multiplexer
+./basht                      # an interactive shell brings up the multiplexer
 ```
 
 Non-interactive shells and scripts are untouched: `bash -c`, cron jobs and
