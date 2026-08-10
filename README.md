@@ -9,7 +9,7 @@ you are typing survives untouched at the bottom of the screen.
 [![basht demo — click to watch with narration](media/demo-preview.gif)](https://youtu.be/stjK6rqtQno)
 
 **[▶ Watch the full demo with narration (9 min, YouTube)](https://youtu.be/stjK6rqtQno)**
-&nbsp;·&nbsp; [raw mp4](https://github.com/samiam95124/basht/releases/download/v0.1/basht-demo.mp4)
+
 
 ```
 [bash:0:2652461:3] $ test/hello 300 30 &
