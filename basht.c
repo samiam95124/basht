@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,38 @@
 
 int basht_active = 0;
 int basht_tty = -1;
+
+/* BASHT_DEBUG=<file>: append a trace of everything that touches the
+   input path -- for hunting rare lost-keystroke reports. */
+static FILE *dbglog;
+
+static void
+dbg (const char *fmt, ...)
+{
+  va_list ap;
+
+  if (dbglog == 0)
+    return;
+  va_start (ap, fmt);
+  vfprintf (dbglog, fmt, ap);
+  va_end (ap);
+  fputc ('\n', dbglog);
+  fflush (dbglog);
+}
+
+static const char *
+dbgch (int c)
+{
+  static char b[8];
+
+  if (c == EOF)
+    return "<EOF>";
+  if (c >= 0x21 && c <= 0x7e)
+    snprintf (b, sizeof b, "%c", c);
+  else
+    snprintf (b, sizeof b, "\\x%02x", (unsigned char)c);
+  return b;
+}
 
 static BASHT_STREAM self;	/* task 0 */
 static int self_master = -1;	/* master side of task 0's pty */
@@ -644,6 +677,7 @@ basht_command_begin (void)
   basht_drain ();
   basht_display_set_default (0);
   basht_display_sync ();
+  dbg ("command_begin (line accepted)");
 }
 
 /* ---- phase 3: the foreground pump --------------------------------
@@ -668,6 +702,8 @@ fg_signal (pid_t pid, int sig)
 {
   pid_t pg = getpgid (pid);
 
+  dbg ("fg_signal sig=%d pid=%d pg=%d (self pg=%d)",
+       sig, (int)pid, (int)pg, (int)getpgrp ());
   if (pg > 0)
     killpg (pg, sig);
   else
@@ -715,6 +751,7 @@ basht_fg_pump (pid_t pid)
 	  if (tcsetattr (0, TCSANOW, &t) == 0)
 	    fg_raw = 1;
 	}
+      dbg ("fg episode start pid=%d", (int)pid);
       fg_pid = pid;
       fg_stdin_open = 1;
       memset (&fg_rly, 0, sizeof fg_rly);
@@ -810,6 +847,7 @@ basht_fg_pump (pid_t pid)
 	      }
 	    else if (c == '\t' || c >= 0x20)
 	      {
+		dbg ("relay %s", dbgch (c));
 		if (fg_rly.lb.len < BASHT_LINEBUF_CAP - 2)
 		  {
 		    fg_rly.lb.data[fg_rly.lb.len++] = (char)c;
@@ -843,6 +881,9 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
+  if (fg_rly.lb.len > 0)
+    dbg ("fg_end stuff-back %d chars '%.*s'", (int)fg_rly.lb.len,
+	 (int)fg_rly.lb.len, fg_rly.lb.data);
   for (i = 0; i < fg_rly.lb.len; i++)
     rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
   fg_rly.lb.len = fg_rly.lb.cur = 0;
@@ -928,9 +969,17 @@ basht_getc (FILE *stream)
       tv.tv_usec = 200000;
       r = select (maxfd + 1, &rf, 0, 0, &tv);
       if (r > 0 && FD_ISSET (fd, &rf))
-	return rl_getc (stream);
+	{
+	  int c = rl_getc (stream);
+	  dbg ("getc %s", dbgch (c));
+	  return c;
+	}
       if (r < 0 && errno != EINTR)
-	return rl_getc (stream);
+	{
+	  int c = rl_getc (stream);
+	  dbg ("getc(e) %s", dbgch (c));
+	  return c;
+	}
       /* timeout, EINTR, or pty traffic: drain and wait again */
     }
 }
@@ -1007,6 +1056,15 @@ basht_init (void)
   }
 
   rl_getc_function = basht_getc;
+
+  {
+    const char *p = getenv ("BASHT_DEBUG");
+    if (p && *p)
+      {
+	dbglog = fopen (p, "a");
+	dbg ("=== basht %d up ===", (int)getpid ());
+      }
+  }
 
   basht_active = 1;
 }
