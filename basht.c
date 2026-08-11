@@ -736,8 +736,10 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
 }
 
 /* Raw keyboard bytes become relay input for CP: printables build
-   RLY's pending line (displayed "[name:N<] prompt typed-text"),
-   Enter ships the typed part to the task's in pty, backspace edits,
+   RLY's pending line, displayed under the task's own tag (same
+   width, so typing never shifts the line) as "[name:N] prompt
+   typed-text". Enter ships the typed part to the task's in pty and
+   the completed record scrolls up marked '<'; backspace edits,
    ^C/^Z signal the task's process group, ^D forwards VEOF. Shared
    by the foreground pump and the prompt-time relay. */
 static void
@@ -760,7 +762,9 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
       else if (c == '\r' || c == '\n')
 	{
 	  relay_prefix (cp, rly);
+	  rly->mark = '<';	/* the record notes keyboard origin */
 	  basht_display_line (rly, rly->lb.data, rly->lb.len);
+	  rly->mark = 0;
 	  if (cp->m_in >= 0)
 	    {
 	      rly->lb.data[rly->lb.len] = '\n';
@@ -848,7 +852,6 @@ basht_fg_pump (pid_t pid)
       memset (&fg_rly, 0, sizeof fg_rly);
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
-      fg_rly.mark = '<';
       fg_rly.pid = cp->pid;
       fg_rly.lines = cp->out.lines;
     }
@@ -1053,7 +1056,6 @@ prompt_relay_bind (struct basht_cap *cp)
   memset (&prompt_rly, 0, sizeof prompt_rly);
   strcpy (prompt_rly.name, cp->out.name);
   prompt_rly.id = cp->out.id;
-  prompt_rly.mark = '<';
   prompt_rly.pid = cp->pid;
   prompt_rly.lines = cp->out.lines;
   rslot = (int)(cp - caps);
