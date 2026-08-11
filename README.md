@@ -47,10 +47,13 @@ task 0's unfinished line.
   mid-line, the shell included, in a ring — at the prompt and during a
   foreground command alike (the foreground task is always in the ring).
   At the prompt, selection is just a forced instance of the ownership
-  rule — the next task to prompt takes the console back. During a
-  foreground command the selection holds until the selected task goes
-  away; selecting the shell there turns typing into a visible type-ahead
-  line for the next prompt — Up/Down browse the shell history on it, and
+  rule — the next task to prompt takes the console back. A task you
+  cycle away from keeps its half-typed input line and shows it again
+  when reselected; the text expires into the shell's command line only
+  when the task exits or finishes its output line. During a foreground
+  command the selection holds until the selected task goes away;
+  selecting the shell there turns typing into a visible type-ahead line
+  for the next prompt — Up/Down browse the shell history on it, and
   Enter queues the line to run when the prompt returns.
 - **Serial foreground**: a command run without `&` takes the console like
   stock bash; typing relays to its stdin, `^C`/`^Z` are delivered by

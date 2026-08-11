@@ -1274,29 +1274,60 @@ prompt_target (void)
   return cp;
 }
 
-/* The relay's task went away or completed its line with input still
-   pending: the typed characters become readline type-ahead, exactly
-   as in basht_fg_end. Returns the first pending char (the caller
-   hands it to readline now; the rest are queued behind it) or -1. */
-static int
+/* The relay's bound task died or completed its line: its pending
+   typed text expires. Never park text in readline's input queue
+   while readline is active -- queued characters are consumed
+   between the physical bytes of any escape sequence readline is
+   mid-way through reading, shredding both (an up-arrow after a
+   stuffed line yields "ESC t" plus a literal "[A"). At the prompt
+   the text goes into readline's line buffer instead: visible,
+   editable, correctly ordered. */
+static void
 prompt_relay_drop (void)
 {
-  int c = -1;
+  char txt[BASHT_LINEBUF_CAP];
+  size_t len = 0;
 
   if (prompt_rly.lb.len > prompt_rly.lb.fix)
     {
-      size_t fix = prompt_rly.lb.fix;
-      dbg ("prompt relay stuff-back %d chars '%.*s'",
-	   (int)(prompt_rly.lb.len - fix),
-	   (int)(prompt_rly.lb.len - fix), prompt_rly.lb.data + fix);
-      c = (unsigned char)prompt_rly.lb.data[fix];
-      for (size_t i = fix + 1; i < prompt_rly.lb.len; i++)
-	rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+      len = prompt_rly.lb.len - prompt_rly.lb.fix;
+      memcpy (txt, prompt_rly.lb.data + prompt_rly.lb.fix, len);
+      txt[len] = '\0';
+      dbg ("prompt relay drop-back %d chars '%s'", (int)len, txt);
+      rl_point = rl_end;
+      rl_insert_text (txt);
     }
   prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
   basht_display_stream_gone (&prompt_rly);
   rslot = -1;
-  return c;
+  if (len)
+    {
+      const BASHT_STREAM *own = basht_display_owner ();
+      if (own == 0 || own == &self)
+	rl_redisplay ();	/* incremental: draws just the new
+				   text after the prompt already on
+				   the shell's line */
+    }
+}
+
+/* Is the relay's bound task gone, or done with its line? Pending
+   input expires then; while the task merely lost the console
+   (another task or the shell was selected) it keeps its half-typed
+   line and shows it again when reselected. */
+static int
+rslot_dead (void)
+{
+  struct basht_cap *cp;
+
+  if (rslot < 0)
+    return 0;
+  cp = &caps[rslot];
+  if (cp->pid != prompt_rly.pid || cp->out.id != prompt_rly.id
+      || cp->m_in < 0)
+    return 1;
+  if (cp->out.lb.len == 0 && cp->err.lb.len == 0)
+    return 1;			/* line completed */
+  return 0;
 }
 
 /* Bind the relay to CP (a task just took, or stole, the console).
@@ -1306,8 +1337,27 @@ prompt_relay_bind (struct basht_cap *cp)
 {
   if (rslot == (int)(cp - caps) && prompt_rly.pid == cp->pid)
     return;
-  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
-    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+  if (prompt_rly.lb.len > prompt_rly.lb.fix)
+    {
+      /* typing switched tasks with a line half-typed: the old text
+	 becomes shell type-ahead. Queue it only while readline is
+	 dormant (foreground episode); at the prompt it goes into
+	 the line buffer -- see prompt_relay_drop. */
+      if (fg_pid > 0)
+	{
+	  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
+	    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+	}
+      else
+	{
+	  char txt[BASHT_LINEBUF_CAP];
+	  size_t len = prompt_rly.lb.len - prompt_rly.lb.fix;
+	  memcpy (txt, prompt_rly.lb.data + prompt_rly.lb.fix, len);
+	  txt[len] = '\0';
+	  rl_point = rl_end;
+	  rl_insert_text (txt);
+	}
+    }
   memset (&prompt_rly, 0, sizeof prompt_rly);
   strcpy (prompt_rly.name, cp->out.name);
   prompt_rly.id = cp->out.id;
@@ -1370,15 +1420,8 @@ basht_cycle_owner (int dir)
   if (next == cur)
     return;
 
-  /* half-typed input for the task being left becomes type-ahead */
-  if (rslot >= 0 && rslot != slot[next])
-    {
-      for (size_t k = prompt_rly.lb.fix; k < prompt_rly.lb.len; k++)
-	rl_stuff_char ((unsigned char)prompt_rly.lb.data[k]);
-      prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
-      basht_display_stream_gone (&prompt_rly);
-      rslot = -1;
-    }
+  /* a task being left keeps its half-typed line (each task owns
+     its input buffer); it shows again when the task is reselected */
 
   manual_sel = cand[next];
   manual_sel_pid = slot[next] < 0 ? -1 : caps[slot[next]].pid;
@@ -1443,16 +1486,10 @@ basht_getc (FILE *stream)
       basht_drain ();
 
       /* relay input pending for a task that vanished or completed
-	 its line: it becomes readline type-ahead now */
-      if (rslot >= 0 && prompt_target () == 0)
-	{
-	  int c = prompt_relay_drop ();
-	  if (c >= 0)
-	    {
-	      dbg ("getc(stuffed) %s", dbgch (c));
-	      return c;
-	    }
-	}
+	 its line expires into the shell's command line; while the
+	 task merely lost the console, it keeps its half-typed line */
+      if (rslot >= 0 && rslot_dead ())
+	prompt_relay_drop ();
 
       FD_ZERO (&rf);
       FD_SET (fd, &rf);
