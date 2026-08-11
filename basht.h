@@ -98,7 +98,7 @@ int  basht_send_input (const char *, int, const char *);
 int  basht_console_clear (int keep);
                                 /* `clear' builtin: 1 = cleared; 0 =
                                    caller falls back to stdout */
-int  basht_bridge_main (const char *, const char *);
+int  basht_bridge_main (const char *, const char *, const char *);
                                 /* --basht-bridge: run inside the
                                    spawned terminal window */
 

@@ -124,7 +124,7 @@ Non-interactive shells and scripts are untouched: `bash -c`, cron jobs and
 ## Limitations (v1)
 
 Line-oriented commands are the point; full-screen programs belong in their
-windows. Window resize after attach isn't propagated; pipeline stdin relay
+windows. Pipeline stdin relay
 goes to the last stage; task ids are basht's own, not bash's `%n` job
 numbers; very long entry lines wrap and erase imperfectly. Nested shells
 run without job control (a capture pty is not a controlling terminal) —
