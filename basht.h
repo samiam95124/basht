@@ -30,6 +30,10 @@ struct basht_linebuf {
   char   data[BASHT_LINEBUF_CAP];
   size_t len;                   /* logical line length            */
   size_t cur;                   /* cursor position, always <= len */
+  size_t fix;                   /* immutable prefix: relay lines
+                                   carry the task's echoed prompt
+                                   here; never shipped or edited.
+                                   Always 0 for filtered streams. */
   enum basht_filt_state fs;
   int    csi_n;                 /* first CSI numeric parameter    */
   int    csi_more;              /* saw ';' -- later params ignored */
@@ -39,8 +43,7 @@ struct basht_linebuf {
 typedef struct basht_stream {
   char name[BASHT_NAME_MAX];
   int  id;
-  char mark;                    /* 0 stdout, '!' stderr, '*' event,
-                                   '<' relayed input */
+  char mark;                    /* 0 stdout, '!' stderr, '*' event */
   pid_t pid;                    /* shown in the tag; kill-able */
   int  *lines;                  /* shared per-task line counter:
                                    ++ on each completed line */
@@ -63,6 +66,7 @@ void basht_display_partial (const BASHT_STREAM *);
 void basht_display_stream_gone (const BASHT_STREAM *);
 void basht_display_sync (void);
 void basht_display_set_default (const BASHT_STREAM *);
+const BASHT_STREAM *basht_display_owner (void);
 void basht_display_set_terminal (int);
 void basht_write_all (int, const void *, size_t);
 

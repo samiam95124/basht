@@ -686,7 +686,7 @@ basht_command_begin (void)
    waitpid. Keeps every pty draining while a foreground job runs,
    and relays the real keyboard to the job: the terminal goes raw
    (ISIG off), typed characters build the job's pending input line
-   (displayed as "[name:N<] text"), Enter ships it to the job's in
+   under the job's own tag, Enter ships it to the job's in
    pty, ^C/^Z become killpg(SIGINT/SIGTSTP) on the job's process
    group, ^D sends VEOF. Returns 1 if it pumped (caller should then
    reap with WNOHANG), 0 to fall back to a blocking wait. */
@@ -708,6 +708,105 @@ fg_signal (pid_t pid, int sig)
     killpg (pg, sig);
   else
     kill (pid, sig);
+}
+
+/* Starting a relay line: seed it with the task's own partial (the
+   prompt), so the input line reads "enter a line: typed text" just
+   as echo on a shared terminal would. The prefix is display-only:
+   never shipped, never backspaced over. */
+static void
+relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
+{
+  const struct basht_linebuf *src = 0;
+  size_t n;
+
+  if (rly->lb.len > 0 || rly->lb.fix > 0)
+    return;			/* line already started */
+  if (cp->out.lb.len > 0)
+    src = &cp->out.lb;
+  else if (cp->err.lb.len > 0)
+    src = &cp->err.lb;
+  if (src == 0)
+    return;
+  n = src->len;
+  if (n > BASHT_LINEBUF_CAP / 2)	/* keep room for typing */
+    n = BASHT_LINEBUF_CAP / 2;
+  memcpy (rly->lb.data, src->data, n);
+  rly->lb.len = rly->lb.cur = rly->lb.fix = n;
+}
+
+/* Raw keyboard bytes become relay input for CP: printables build
+   RLY's pending line, displayed under the task's own tag (same
+   width, so typing never shifts the line) as "[name:N] prompt
+   typed-text". Enter ships the typed part to the task's in pty;
+   the record that scrolls up is the task's line as a shared
+   terminal would have shown it -- prompt plus echoed input, ended
+   by Enter's echo -- so the task's pending line is completed by it
+   and the task's next output starts fresh. Backspace edits, ^C/^Z
+   signal the task's process group, ^D forwards VEOF. Shared by the
+   foreground pump and the prompt-time relay. */
+static void
+relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
+	     const char *buf, ssize_t n)
+{
+  for (ssize_t k = 0; k < n; k++)
+    {
+      unsigned char c = (unsigned char)buf[k];
+      if (c == 0x03)		/* ^C */
+	fg_signal (cp->pid, SIGINT);
+      else if (c == 0x1a)		/* ^Z */
+	fg_signal (cp->pid, SIGTSTP);
+      else if (c == 0x04)		/* ^D */
+	{
+	  char e = 0x04;
+	  if (cp->m_in >= 0)
+	    basht_write_all (cp->m_in, &e, 1);
+	}
+      else if (c == '\r' || c == '\n')
+	{
+	  relay_prefix (cp, rly);
+	  basht_display_line (rly, rly->lb.data, rly->lb.len);
+	  if (cp->m_in >= 0)
+	    {
+	      rly->lb.data[rly->lb.len] = '\n';
+	      basht_write_all (cp->m_in, rly->lb.data + rly->lb.fix,
+			       rly->lb.len - rly->lb.fix + 1);
+	    }
+	  rly->lb.len = rly->lb.cur = rly->lb.fix = 0;
+	  basht_display_partial (rly);
+	  /* Enter's echo ends the task's pending line on a shared
+	     terminal, and the record just displayed IS that line:
+	     complete it, so the task's next output starts fresh */
+	  if (cp->out.lb.len > 0)
+	    {
+	      cp->out.lb.len = cp->out.lb.cur = 0;
+	      basht_display_partial (&cp->out);
+	    }
+	  else if (cp->err.lb.len > 0)
+	    {
+	      cp->err.lb.len = cp->err.lb.cur = 0;
+	      basht_display_partial (&cp->err);
+	    }
+	}
+      else if (c == 0x7f || c == '\b')
+	{
+	  if (rly->lb.len > rly->lb.fix)
+	    rly->lb.cur = --rly->lb.len;
+	  basht_display_partial (rly);
+	}
+      else if (c == '\t' || c >= 0x20)
+	{
+	  dbg ("relay %s", dbgch (c));
+	  relay_prefix (cp, rly);
+	  if (rly->lb.len < BASHT_LINEBUF_CAP - 2)
+	    {
+	      rly->lb.data[rly->lb.len++] = (char)c;
+	      rly->lb.cur = rly->lb.len;
+	    }
+	  basht_display_partial (rly);
+	}
+      /* other control characters are dropped */
+    }
 }
 
 int
@@ -757,7 +856,6 @@ basht_fg_pump (pid_t pid)
       memset (&fg_rly, 0, sizeof fg_rly);
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
-      fg_rly.mark = '<';
       fg_rly.pid = cp->pid;
       fg_rly.lines = cp->out.lines;
     }
@@ -814,49 +912,7 @@ basht_fg_pump (pid_t pid)
 	  fg_stdin_open = 0;
 	}
       else
-	for (ssize_t k = 0; k < n; k++)
-	  {
-	    unsigned char c = (unsigned char)buf[k];
-	    if (c == 0x03)		/* ^C */
-	      fg_signal (pid, SIGINT);
-	    else if (c == 0x1a)		/* ^Z */
-	      fg_signal (pid, SIGTSTP);
-	    else if (c == 0x04)		/* ^D */
-	      {
-		char e = 0x04;
-		if (cp->m_in >= 0)
-		  basht_write_all (cp->m_in, &e, 1);
-	      }
-	    else if (c == '\r' || c == '\n')
-	      {
-		basht_display_line (&fg_rly, fg_rly.lb.data, fg_rly.lb.len);
-		if (cp->m_in >= 0)
-		  {
-		    fg_rly.lb.data[fg_rly.lb.len] = '\n';
-		    basht_write_all (cp->m_in, fg_rly.lb.data,
-				     fg_rly.lb.len + 1);
-		  }
-		fg_rly.lb.len = fg_rly.lb.cur = 0;
-		basht_display_partial (&fg_rly);
-	      }
-	    else if (c == 0x7f || c == '\b')
-	      {
-		if (fg_rly.lb.len > 0)
-		  fg_rly.lb.cur = --fg_rly.lb.len;
-		basht_display_partial (&fg_rly);
-	      }
-	    else if (c == '\t' || c >= 0x20)
-	      {
-		dbg ("relay %s", dbgch (c));
-		if (fg_rly.lb.len < BASHT_LINEBUF_CAP - 2)
-		  {
-		    fg_rly.lb.data[fg_rly.lb.len++] = (char)c;
-		    fg_rly.lb.cur = fg_rly.lb.len;
-		  }
-		basht_display_partial (&fg_rly);
-	      }
-	    /* other control characters are dropped */
-	  }
+	relay_chars (cp, &fg_rly, buf, n);
     }
 
   basht_drain ();
@@ -881,12 +937,14 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
-  if (fg_rly.lb.len > 0)
-    dbg ("fg_end stuff-back %d chars '%.*s'", (int)fg_rly.lb.len,
-	 (int)fg_rly.lb.len, fg_rly.lb.data);
-  for (i = 0; i < fg_rly.lb.len; i++)
+  if (fg_rly.lb.len > fg_rly.lb.fix)
+    dbg ("fg_end stuff-back %d chars '%.*s'",
+	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
+	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
+	 fg_rly.lb.data + fg_rly.lb.fix);
+  for (i = fg_rly.lb.fix; i < fg_rly.lb.len; i++)
     rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
-  fg_rly.lb.len = fg_rly.lb.cur = 0;
+  fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
   basht_display_stream_gone (&fg_rly);
   basht_drain ();
 }
@@ -915,6 +973,100 @@ basht_send_input (const char *name, int inst, const char *text)
   return 0;
 }
 
+/* ---- prompt-time relay: input follows the incomplete-line rule --
+
+   While readline is reading the shell's command line, a captured
+   task may take the console by printing a prompt (a character on an
+   incomplete line). Ownership routes the keyboard: that task gets
+   the keystrokes, through the same relay as the foreground pump,
+   until it completes a line and the console reverts to the shell.
+   The shell's own prompt is just task 0's incomplete line -- the
+   shell lives by the same rule. */
+
+static BASHT_STREAM prompt_rly;
+static int rslot = -1;		/* caps[] slot the relay is bound to */
+
+/* The captured task, if any, that should receive keystrokes typed
+   while readline is reading: the bottom-line owner's task, while it
+   is still mid-line with an open in pty. 0 = input is the shell's. */
+static struct basht_cap *
+prompt_target (void)
+{
+  const BASHT_STREAM *own = basht_display_owner ();
+  struct basht_cap *cp = 0;
+
+  if (own == 0)
+    return 0;
+  if (own == &prompt_rly)
+    {
+      if (rslot < 0)
+	return 0;
+      cp = &caps[rslot];
+      if (cp->pid != prompt_rly.pid || cp->out.id != prompt_rly.id)
+	return 0;
+    }
+  else
+    {
+      for (int i = 0; i < BASHT_MAX_CAPS; i++)
+	if (own == &caps[i].out || own == &caps[i].err)
+	  {
+	    cp = &caps[i];
+	    break;
+	  }
+    }
+  if (cp == 0 || cp->out.id == 0 || cp->m_in < 0)
+    return 0;
+  if (cp->windowed || cp->w_was)
+    return 0;			/* keyboard comes from the window */
+  if (cp->out.lb.len == 0 && cp->err.lb.len == 0)
+    return 0;			/* line completed: console released */
+  return cp;
+}
+
+/* The relay's task went away or completed its line with input still
+   pending: the typed characters become readline type-ahead, exactly
+   as in basht_fg_end. Returns the first pending char (the caller
+   hands it to readline now; the rest are queued behind it) or -1. */
+static int
+prompt_relay_drop (void)
+{
+  int c = -1;
+
+  if (prompt_rly.lb.len > prompt_rly.lb.fix)
+    {
+      size_t fix = prompt_rly.lb.fix;
+      dbg ("prompt relay stuff-back %d chars '%.*s'",
+	   (int)(prompt_rly.lb.len - fix),
+	   (int)(prompt_rly.lb.len - fix), prompt_rly.lb.data + fix);
+      c = (unsigned char)prompt_rly.lb.data[fix];
+      for (size_t i = fix + 1; i < prompt_rly.lb.len; i++)
+	rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+    }
+  prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
+  basht_display_stream_gone (&prompt_rly);
+  rslot = -1;
+  return c;
+}
+
+/* Bind the relay to CP (a task just took, or stole, the console).
+   A half-typed line for a previous task becomes type-ahead. */
+static void
+prompt_relay_bind (struct basht_cap *cp)
+{
+  if (rslot == (int)(cp - caps) && prompt_rly.pid == cp->pid)
+    return;
+  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
+    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+  memset (&prompt_rly, 0, sizeof prompt_rly);
+  strcpy (prompt_rly.name, cp->out.name);
+  prompt_rly.id = cp->out.id;
+  prompt_rly.pid = cp->pid;
+  prompt_rly.lines = cp->out.lines;
+  rslot = (int)(cp - caps);
+  dbg ("prompt relay bind [%s:%d] pid=%d", prompt_rly.name,
+       prompt_rly.id, (int)prompt_rly.pid);
+}
+
 /* readline's character source. Instead of rl_event_hook (whose
    wait loop spins forever on non-tty EOF), we select over stdin and
    the task-0 master: output drains the moment it lands in the pty,
@@ -935,6 +1087,19 @@ basht_getc (FILE *stream)
       int r, maxfd;
 
       basht_drain ();
+
+      /* relay input pending for a task that vanished or completed
+	 its line: it becomes readline type-ahead now */
+      if (rslot >= 0 && prompt_target () == 0)
+	{
+	  int c = prompt_relay_drop ();
+	  if (c >= 0)
+	    {
+	      dbg ("getc(stuffed) %s", dbgch (c));
+	      return c;
+	    }
+	}
+
       FD_ZERO (&rf);
       FD_SET (fd, &rf);
       maxfd = fd;
@@ -970,6 +1135,22 @@ basht_getc (FILE *stream)
       r = select (maxfd + 1, &rf, 0, 0, &tv);
       if (r > 0 && FD_ISSET (fd, &rf))
 	{
+	  struct basht_cap *cp = prompt_target ();
+	  if (cp)
+	    {
+	      /* the console owner is a task mid-line: these
+		 keystrokes are its input, not the shell's */
+	      char buf[256];
+	      ssize_t n = read (fd, buf, sizeof buf);
+	      if (n > 0)
+		{
+		  prompt_relay_bind (cp);
+		  relay_chars (cp, &prompt_rly, buf, n);
+		  basht_display_sync ();
+		  continue;
+		}
+	      /* EOF or error: readline's problem */
+	    }
 	  int c = rl_getc (stream);
 	  dbg ("getc %s", dbgch (c));
 	  return c;
