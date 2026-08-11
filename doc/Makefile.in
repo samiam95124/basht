@@ -263,6 +263,7 @@ installdirs:
 	
 install: info installdirs
 	-$(INSTALL_DATA) $(srcdir)/bash.1 $(DESTDIR)$(man1dir)/bash${man1ext}
+	-$(INSTALL_DATA) $(srcdir)/basht.1 $(DESTDIR)$(man1dir)/basht${man1ext}
 	-$(INSTALL_DATA) $(srcdir)/bashbug.1 $(DESTDIR)$(man1dir)/bashbug${man1ext}
 	-$(INSTALL_DATA) $(OTHER_DOCS) $(DESTDIR)$(docdir)
 # uncomment the next lines to install the builtins man page
@@ -306,6 +307,7 @@ uninstall-html:
 
 uninstall:
 	-$(RM) $(DESTDIR)$(man1dir)/bash${man1ext} $(DESTDIR)$(man1dir)/bashbug${man1ext}
+	-$(RM) $(DESTDIR)$(man1dir)/basht${man1ext}
 	-$(RM) $(DESTDIR)$(man1dir)/bash_builtins${man1ext}
 	$(RM) $(DESTDIR)$(infodir)/bash.info
 # run install-info if it is present to update the info directory
