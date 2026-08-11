@@ -36,6 +36,7 @@
 #include "jobs.h"		/* FORK_* flags */
 
 #include <readline/readline.h>
+#include <readline/history.h>
 
 #include "basht.h"
 
@@ -356,6 +357,7 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
 }
 
 static void fg_signal (pid_t, int);
+static void basht_cycle_owner (int);
 
 /* ---- auto-window: full-screen tasks move to a terminal window ---
 
@@ -697,6 +699,71 @@ static int   fg_stdin_open = 1;
 static pid_t fg_pid = -1;
 static BASHT_STREAM fg_rly;
 
+/* Manual keyboard selection (alt-arrows) during a foreground
+   episode: 0 = the foreground task (the default), &self = the
+   shell (keystrokes become readline type-ahead for the next
+   prompt), else a background task's stream. Validated against the
+   caps table on every use; reset at episode boundaries. */
+static const BASHT_STREAM *manual_sel;
+static pid_t manual_sel_pid;
+static struct basht_linebuf fg_ta_esc;	/* type-ahead escape state */
+static BASHT_STREAM ta_rly;	/* the shell's visible type-ahead
+				   line: typed while the shell is
+				   selected during a foreground
+				   episode, queued to readline on
+				   Enter (and at episode end) */
+static int ta_hist = -1;	/* history browse cursor; -1 = the
+				   line being typed */
+static char ta_stash[BASHT_LINEBUF_CAP];
+static size_t ta_stash_len;	/* typed line saved while browsing */
+
+static void
+ta_set (const char *s, size_t len)
+{
+  if (len > BASHT_LINEBUF_CAP - 2)
+    len = BASHT_LINEBUF_CAP - 2;
+  memcpy (ta_rly.lb.data, s, len);
+  ta_rly.lb.len = ta_rly.lb.cur = len;
+  basht_display_partial (&ta_rly);
+}
+
+/* Up/Down on the shell's type-ahead line browse the shell history,
+   the way the prompt would; readline itself is not running while
+   the shell waits on a foreground job. */
+static void
+ta_history (int dir)
+{
+  HIST_ENTRY **hl = history_list ();
+
+  if (hl == 0 || history_length == 0)
+    return;
+  if (ta_hist < 0)
+    {
+      if (dir > 0)
+	return;			/* nothing below the current line */
+      memcpy (ta_stash, ta_rly.lb.data, ta_rly.lb.len);
+      ta_stash_len = ta_rly.lb.len;
+      ta_hist = history_length - 1;
+    }
+  else if (dir < 0)
+    {
+      if (ta_hist > 0)
+	ta_hist--;
+    }
+  else if (++ta_hist >= history_length)
+    {
+      ta_hist = -1;		/* below the list: the typed line */
+      ta_set (ta_stash, ta_stash_len);
+      return;
+    }
+  ta_set (hl[ta_hist]->line, strlen (hl[ta_hist]->line));
+}
+
+/* the prompt-time relay, defined with its router further down */
+static BASHT_STREAM prompt_rly;
+static int rslot;
+static void prompt_relay_bind (struct basht_cap *);
+
 static void
 fg_signal (pid_t pid, int sig)
 {
@@ -743,15 +810,97 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
    terminal would have shown it -- prompt plus echoed input, ended
    by Enter's echo -- so the task's pending line is completed by it
    and the task's next output starts fresh. Backspace edits, ^C/^Z
-   signal the task's process group, ^D forwards VEOF. Shared by the
+   signal the task's process group, ^D forwards VEOF. Escape
+   sequences are swallowed, never typed into the line; when CYCLES
+   is set (prompt-time relay) alt-left/right (CSI 1;3 D/C) cycle
+   the console between the inputting tasks. Shared by the
    foreground pump and the prompt-time relay. */
+/* Escape-sequence scanner shared by every keyboard sink: sequences
+   are swallowed, never typed into a line; alt-left/right (CSI 1;3
+   D/C) cycle the console when CYCLES is set. ST holds the parse
+   state (only fs and the csi fields are used; BF_OSC is borrowed
+   to mean "SS3 pending" -- relay buffers never meet the output
+   filter, so there is no clash). Returns KESC_NONE for an
+   ordinary byte, KESC_EAT for sequence bytes, KESC_UP/DOWN for a
+   plain up/down arrow (CSI/SS3 A/B), which the caller may act on. */
+#define KESC_NONE 0
+#define KESC_EAT  1
+#define KESC_UP   2
+#define KESC_DOWN 3
+
+static int
+key_escape (struct basht_linebuf *st, unsigned char c, int cycles)
+{
+  if (st->fs == BF_ESC)
+    {
+      if (c == '[')
+	{
+	  st->fs = BF_CSI;
+	  st->csi_n = st->csi_n2 = 0;
+	  st->csi_more = 0;
+	}
+      else if (c == 'O')
+	st->fs = BF_OSC;	/* SS3: one key byte follows */
+      else
+	st->fs = BF_NORMAL;	/* ESC x: swallow both */
+      return KESC_EAT;
+    }
+  if (st->fs == BF_OSC)
+    {
+      st->fs = BF_NORMAL;
+      if (c == 'A')
+	return KESC_UP;
+      if (c == 'B')
+	return KESC_DOWN;
+      return KESC_EAT;
+    }
+  if (st->fs == BF_CSI)
+    {
+      if (c >= '0' && c <= '9')
+	{
+	  if (st->csi_more)
+	    st->csi_n2 = st->csi_n2 * 10 + (c - '0');
+	  else
+	    st->csi_n = st->csi_n * 10 + (c - '0');
+	}
+      else if (c == ';')
+	st->csi_more = 1;
+      else if (c >= 0x40 && c <= 0x7e)
+	{
+	  st->fs = BF_NORMAL;
+	  if (cycles && st->csi_n == 1 && st->csi_n2 == 3
+	      && (c == 'C' || c == 'D'))
+	    {
+	      basht_cycle_owner (c == 'C' ? 1 : -1);
+	      return KESC_EAT;
+	    }
+	  if (st->csi_n == 0 && st->csi_more == 0)
+	    {
+	      if (c == 'A')
+		return KESC_UP;
+	      if (c == 'B')
+		return KESC_DOWN;
+	    }
+	}
+      return KESC_EAT;
+    }
+  if (c == 0x1b)
+    {
+      st->fs = BF_ESC;
+      return KESC_EAT;
+    }
+  return KESC_NONE;
+}
+
 static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
-	     const char *buf, ssize_t n)
+	     const char *buf, ssize_t n, int cycles)
 {
   for (ssize_t k = 0; k < n; k++)
     {
       unsigned char c = (unsigned char)buf[k];
+      if (key_escape (&rly->lb, c, cycles))
+	continue;
       if (c == 0x03)		/* ^C */
 	fg_signal (cp->pid, SIGINT);
       else if (c == 0x1a)		/* ^Z */
@@ -809,6 +958,31 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
     }
 }
 
+/* Keyboard target during a foreground episode: the foreground cap
+   CP unless a manual selection overrides it and is still valid.
+   Returns 0 for the shell (type-ahead). */
+static struct basht_cap *
+fg_target (struct basht_cap *cp)
+{
+  int i;
+
+  if (manual_sel == 0)
+    return cp;
+  if (manual_sel == &self)
+    return 0;
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      struct basht_cap *bp = &caps[i];
+      if ((manual_sel == &bp->out || manual_sel == &bp->err)
+	  && bp->pid == manual_sel_pid && bp->out.id != 0
+	  && bp->m_in >= 0
+	  && (bp == cp || bp->out.lb.len > 0 || bp->err.lb.len > 0))
+	return bp;
+    }
+  manual_sel = 0;		/* the selected task went away */
+  return cp;
+}
+
 int
 basht_fg_pump (pid_t pid)
 {
@@ -853,6 +1027,13 @@ basht_fg_pump (pid_t pid)
       dbg ("fg episode start pid=%d", (int)pid);
       fg_pid = pid;
       fg_stdin_open = 1;
+      manual_sel = 0;
+      fg_ta_esc.fs = BF_NORMAL;
+      ta_hist = -1;
+      memset (&ta_rly, 0, sizeof ta_rly);
+      strcpy (ta_rly.name, "bash");
+      ta_rly.pid = self.pid;
+      ta_rly.lines = self.lines;
       memset (&fg_rly, 0, sizeof fg_rly);
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
@@ -911,8 +1092,68 @@ basht_fg_pump (pid_t pid)
 	    basht_write_all (cp->m_in, &e, 1);
 	  fg_stdin_open = 0;
 	}
-      else
-	relay_chars (cp, &fg_rly, buf, n);
+      else if (n > 0)
+	{
+	  struct basht_cap *tcp = fg_target (cp);
+	  if (tcp == cp)
+	    relay_chars (cp, &fg_rly, buf, n, 1);
+	  else if (tcp)
+	    {
+	      /* a background task is selected: same relay the
+		 prompt-time router uses */
+	      prompt_relay_bind (tcp);
+	      relay_chars (tcp, &prompt_rly, buf, n, 1);
+	    }
+	  else
+	    {
+	      /* the shell is selected: typing builds a visible
+		 pending line, queued to readline as type-ahead on
+		 Enter -- it echoes and runs when the prompt
+		 returns. Job-control keys still act on the
+		 foreground job (ISIG is off). */
+	      for (ssize_t k = 0; k < n; k++)
+		{
+		  unsigned char c = (unsigned char)buf[k];
+		  int e = key_escape (&fg_ta_esc, c, 1);
+		  if (e == KESC_UP || e == KESC_DOWN)
+		    {
+		      ta_history (e == KESC_UP ? -1 : 1);
+		      continue;
+		    }
+		  if (e)
+		    continue;
+		  if (c == 0x03)
+		    fg_signal (pid, SIGINT);
+		  else if (c == 0x1a)
+		    fg_signal (pid, SIGTSTP);
+		  else if (c == '\r' || c == '\n')
+		    {
+		      for (size_t j = 0; j < ta_rly.lb.len; j++)
+			rl_stuff_char ((unsigned char)ta_rly.lb.data[j]);
+		      rl_stuff_char ('\n');
+		      ta_rly.lb.len = ta_rly.lb.cur = 0;
+		      ta_hist = -1;
+		      basht_display_partial (&ta_rly);
+		      basht_display_set_owner (&self);
+		    }
+		  else if (c == 0x7f || c == '\b')
+		    {
+		      if (ta_rly.lb.len > 0)
+			ta_rly.lb.cur = --ta_rly.lb.len;
+		      basht_display_partial (&ta_rly);
+		    }
+		  else if (c == '\t' || c >= 0x20)
+		    {
+		      if (ta_rly.lb.len < BASHT_LINEBUF_CAP - 2)
+			{
+			  ta_rly.lb.data[ta_rly.lb.len++] = (char)c;
+			  ta_rly.lb.cur = ta_rly.lb.len;
+			}
+		      basht_display_partial (&ta_rly);
+		    }
+		}
+	    }
+	}
     }
 
   basht_drain ();
@@ -937,6 +1178,8 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
+  manual_sel = 0;
+  fg_ta_esc.fs = BF_NORMAL;
   if (fg_rly.lb.len > fg_rly.lb.fix)
     dbg ("fg_end stuff-back %d chars '%.*s'",
 	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
@@ -946,6 +1189,13 @@ basht_fg_end (void)
     rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
   fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
   basht_display_stream_gone (&fg_rly);
+  /* a half-typed shell line queues too: it reappears, editable,
+     at the prompt about to be drawn */
+  for (i = 0; i < ta_rly.lb.len; i++)
+    rl_stuff_char ((unsigned char)ta_rly.lb.data[i]);
+  ta_rly.lb.len = ta_rly.lb.cur = 0;
+  ta_hist = -1;
+  basht_display_stream_gone (&ta_rly);
   basht_drain ();
 }
 
@@ -983,8 +1233,9 @@ basht_send_input (const char *name, int inst, const char *text)
    The shell's own prompt is just task 0's incomplete line -- the
    shell lives by the same rule. */
 
-static BASHT_STREAM prompt_rly;
-static int rslot = -1;		/* caps[] slot the relay is bound to */
+/* prompt_rly and rslot (the caps[] slot the relay is bound to,
+   -1 = none) are declared with the foreground pump state above;
+   rslot is set to -1 at init. */
 
 /* The captured task, if any, that should receive keystrokes typed
    while readline is reading: the bottom-line owner's task, while it
@@ -1023,29 +1274,60 @@ prompt_target (void)
   return cp;
 }
 
-/* The relay's task went away or completed its line with input still
-   pending: the typed characters become readline type-ahead, exactly
-   as in basht_fg_end. Returns the first pending char (the caller
-   hands it to readline now; the rest are queued behind it) or -1. */
-static int
+/* The relay's bound task died or completed its line: its pending
+   typed text expires. Never park text in readline's input queue
+   while readline is active -- queued characters are consumed
+   between the physical bytes of any escape sequence readline is
+   mid-way through reading, shredding both (an up-arrow after a
+   stuffed line yields "ESC t" plus a literal "[A"). At the prompt
+   the text goes into readline's line buffer instead: visible,
+   editable, correctly ordered. */
+static void
 prompt_relay_drop (void)
 {
-  int c = -1;
+  char txt[BASHT_LINEBUF_CAP];
+  size_t len = 0;
 
   if (prompt_rly.lb.len > prompt_rly.lb.fix)
     {
-      size_t fix = prompt_rly.lb.fix;
-      dbg ("prompt relay stuff-back %d chars '%.*s'",
-	   (int)(prompt_rly.lb.len - fix),
-	   (int)(prompt_rly.lb.len - fix), prompt_rly.lb.data + fix);
-      c = (unsigned char)prompt_rly.lb.data[fix];
-      for (size_t i = fix + 1; i < prompt_rly.lb.len; i++)
-	rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+      len = prompt_rly.lb.len - prompt_rly.lb.fix;
+      memcpy (txt, prompt_rly.lb.data + prompt_rly.lb.fix, len);
+      txt[len] = '\0';
+      dbg ("prompt relay drop-back %d chars '%s'", (int)len, txt);
+      rl_point = rl_end;
+      rl_insert_text (txt);
     }
   prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
   basht_display_stream_gone (&prompt_rly);
   rslot = -1;
-  return c;
+  if (len)
+    {
+      const BASHT_STREAM *own = basht_display_owner ();
+      if (own == 0 || own == &self)
+	rl_redisplay ();	/* incremental: draws just the new
+				   text after the prompt already on
+				   the shell's line */
+    }
+}
+
+/* Is the relay's bound task gone, or done with its line? Pending
+   input expires then; while the task merely lost the console
+   (another task or the shell was selected) it keeps its half-typed
+   line and shows it again when reselected. */
+static int
+rslot_dead (void)
+{
+  struct basht_cap *cp;
+
+  if (rslot < 0)
+    return 0;
+  cp = &caps[rslot];
+  if (cp->pid != prompt_rly.pid || cp->out.id != prompt_rly.id
+      || cp->m_in < 0)
+    return 1;
+  if (cp->out.lb.len == 0 && cp->err.lb.len == 0)
+    return 1;			/* line completed */
+  return 0;
 }
 
 /* Bind the relay to CP (a task just took, or stole, the console).
@@ -1055,8 +1337,27 @@ prompt_relay_bind (struct basht_cap *cp)
 {
   if (rslot == (int)(cp - caps) && prompt_rly.pid == cp->pid)
     return;
-  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
-    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+  if (prompt_rly.lb.len > prompt_rly.lb.fix)
+    {
+      /* typing switched tasks with a line half-typed: the old text
+	 becomes shell type-ahead. Queue it only while readline is
+	 dormant (foreground episode); at the prompt it goes into
+	 the line buffer -- see prompt_relay_drop. */
+      if (fg_pid > 0)
+	{
+	  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
+	    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+	}
+      else
+	{
+	  char txt[BASHT_LINEBUF_CAP];
+	  size_t len = prompt_rly.lb.len - prompt_rly.lb.fix;
+	  memcpy (txt, prompt_rly.lb.data + prompt_rly.lb.fix, len);
+	  txt[len] = '\0';
+	  rl_point = rl_end;
+	  rl_insert_text (txt);
+	}
+    }
   memset (&prompt_rly, 0, sizeof prompt_rly);
   strcpy (prompt_rly.name, cp->out.name);
   prompt_rly.id = cp->out.id;
@@ -1065,6 +1366,102 @@ prompt_relay_bind (struct basht_cap *cp)
   rslot = (int)(cp - caps);
   dbg ("prompt relay bind [%s:%d] pid=%d", prompt_rly.name,
        prompt_rly.id, (int)prompt_rly.pid);
+}
+
+/* Alt-Left/Right: cycle the console between the inputting tasks --
+   every stream currently mid-line, the shell included (always
+   inputting while readline reads; during a foreground episode it
+   takes keystrokes as type-ahead for the next prompt). The
+   foreground task is always in the ring, prompt or not. At the
+   prompt, selection is a forced instance of the ownership rule and
+   the next task to write on an incomplete line steals the console
+   back; during a foreground episode the selection holds until the
+   selected task goes away or the episode ends. */
+static void
+basht_cycle_owner (int dir)
+{
+  const BASHT_STREAM *own = basht_display_owner ();
+  const BASHT_STREAM *cand[BASHT_MAX_CAPS + 1];
+  int slot[BASHT_MAX_CAPS + 1];
+  int in_fg = fg_pid > 0;
+  int n = 0, cur = -1, next, i;
+
+  /* the shell first: at the prompt, bot == 0 means input already
+     goes to readline, so it counts as the shell's position */
+  cand[n] = &self;
+  slot[n] = -1;
+  if (in_fg ? manual_sel == &self : (own == 0 || own == &self))
+    cur = n;
+  n++;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      struct basht_cap *cp = &caps[i];
+      int is_fg = in_fg && cp->pid == fg_pid;
+      if (cp->out.id == 0 || cp->m_in < 0 || cp->windowed || cp->w_was)
+	continue;
+      if (is_fg == 0 && cp->out.lb.len == 0 && cp->err.lb.len == 0)
+	continue;
+      cand[n] = cp->out.lb.len > 0 ? &cp->out
+	      : cp->err.lb.len > 0 ? &cp->err : &cp->out;
+      slot[n] = i;
+      if (in_fg
+	  ? (manual_sel ? manual_sel == &cp->out || manual_sel == &cp->err
+			: is_fg)
+	  : (own == &cp->out || own == &cp->err
+	     || (own == &prompt_rly && rslot == i)))
+	cur = n;
+      n++;
+    }
+
+  if (n < 2)
+    return;			/* nothing to switch to */
+  next = cur < 0 ? (dir > 0 ? 0 : n - 1) : (cur + dir + n) % n;
+  if (next == cur)
+    return;
+
+  /* a task being left keeps its half-typed line (each task owns
+     its input buffer); it shows again when the task is reselected */
+
+  manual_sel = cand[next];
+  manual_sel_pid = slot[next] < 0 ? -1 : caps[slot[next]].pid;
+  dbg ("cycle owner %+d -> %s", dir,
+       slot[next] < 0 ? "bash" : caps[slot[next]].out.name);
+
+  /* show the destination's own pending input line, if it has one:
+     the relay buffer carrying half-typed text outranks the task's
+     bare partial */
+  {
+    const BASHT_STREAM *show = cand[next];
+    if (slot[next] < 0)
+      {
+	if (in_fg && ta_rly.lb.len > 0)
+	  show = &ta_rly;
+      }
+    else if (in_fg && caps[slot[next]].pid == fg_pid
+	     && fg_rly.lb.len > 0)
+      show = &fg_rly;
+    else if (rslot == slot[next] && prompt_rly.lb.len > 0)
+      show = &prompt_rly;
+    basht_display_set_owner (show);
+  }
+  basht_display_sync ();
+}
+
+/* the readline ends of the same keys, for when the shell owns the
+   console and the sequence arrives through rl_getc */
+static int
+rl_basht_cycle_right (int count, int key)
+{
+  basht_cycle_owner (1);
+  return 0;
+}
+
+static int
+rl_basht_cycle_left (int count, int key)
+{
+  basht_cycle_owner (-1);
+  return 0;
 }
 
 /* readline's character source. Instead of rl_event_hook (whose
@@ -1089,16 +1486,10 @@ basht_getc (FILE *stream)
       basht_drain ();
 
       /* relay input pending for a task that vanished or completed
-	 its line: it becomes readline type-ahead now */
-      if (rslot >= 0 && prompt_target () == 0)
-	{
-	  int c = prompt_relay_drop ();
-	  if (c >= 0)
-	    {
-	      dbg ("getc(stuffed) %s", dbgch (c));
-	      return c;
-	    }
-	}
+	 its line expires into the shell's command line; while the
+	 task merely lost the console, it keeps its half-typed line */
+      if (rslot >= 0 && rslot_dead ())
+	prompt_relay_drop ();
 
       FD_ZERO (&rf);
       FD_SET (fd, &rf);
@@ -1145,7 +1536,7 @@ basht_getc (FILE *stream)
 	      if (n > 0)
 		{
 		  prompt_relay_bind (cp);
-		  relay_chars (cp, &prompt_rly, buf, n);
+		  relay_chars (cp, &prompt_rly, buf, n, 1);
 		  basht_display_sync ();
 		  continue;
 		}
@@ -1236,7 +1627,10 @@ basht_init (void)
       strcpy (self_exe, "bash");
   }
 
+  rslot = -1;
   rl_getc_function = basht_getc;
+  rl_bind_keyseq ("\033[1;3C", rl_basht_cycle_right);	/* alt-right */
+  rl_bind_keyseq ("\033[1;3D", rl_basht_cycle_left);	/* alt-left  */
 
   {
     const char *p = getenv ("BASHT_DEBUG");
