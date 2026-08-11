@@ -36,6 +36,7 @@
 #include "jobs.h"		/* FORK_* flags */
 
 #include <readline/readline.h>
+#include <readline/history.h>
 
 #include "basht.h"
 
@@ -711,6 +712,52 @@ static BASHT_STREAM ta_rly;	/* the shell's visible type-ahead
 				   selected during a foreground
 				   episode, queued to readline on
 				   Enter (and at episode end) */
+static int ta_hist = -1;	/* history browse cursor; -1 = the
+				   line being typed */
+static char ta_stash[BASHT_LINEBUF_CAP];
+static size_t ta_stash_len;	/* typed line saved while browsing */
+
+static void
+ta_set (const char *s, size_t len)
+{
+  if (len > BASHT_LINEBUF_CAP - 2)
+    len = BASHT_LINEBUF_CAP - 2;
+  memcpy (ta_rly.lb.data, s, len);
+  ta_rly.lb.len = ta_rly.lb.cur = len;
+  basht_display_partial (&ta_rly);
+}
+
+/* Up/Down on the shell's type-ahead line browse the shell history,
+   the way the prompt would; readline itself is not running while
+   the shell waits on a foreground job. */
+static void
+ta_history (int dir)
+{
+  HIST_ENTRY **hl = history_list ();
+
+  if (hl == 0 || history_length == 0)
+    return;
+  if (ta_hist < 0)
+    {
+      if (dir > 0)
+	return;			/* nothing below the current line */
+      memcpy (ta_stash, ta_rly.lb.data, ta_rly.lb.len);
+      ta_stash_len = ta_rly.lb.len;
+      ta_hist = history_length - 1;
+    }
+  else if (dir < 0)
+    {
+      if (ta_hist > 0)
+	ta_hist--;
+    }
+  else if (++ta_hist >= history_length)
+    {
+      ta_hist = -1;		/* below the list: the typed line */
+      ta_set (ta_stash, ta_stash_len);
+      return;
+    }
+  ta_set (hl[ta_hist]->line, strlen (hl[ta_hist]->line));
+}
 
 /* the prompt-time relay, defined with its router further down */
 static BASHT_STREAM prompt_rly;
@@ -771,8 +818,16 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
 /* Escape-sequence scanner shared by every keyboard sink: sequences
    are swallowed, never typed into a line; alt-left/right (CSI 1;3
    D/C) cycle the console when CYCLES is set. ST holds the parse
-   state (only fs and the csi fields are used). Returns 1 if C was
-   consumed as part of a sequence. */
+   state (only fs and the csi fields are used; BF_OSC is borrowed
+   to mean "SS3 pending" -- relay buffers never meet the output
+   filter, so there is no clash). Returns KESC_NONE for an
+   ordinary byte, KESC_EAT for sequence bytes, KESC_UP/DOWN for a
+   plain up/down arrow (CSI/SS3 A/B), which the caller may act on. */
+#define KESC_NONE 0
+#define KESC_EAT  1
+#define KESC_UP   2
+#define KESC_DOWN 3
+
 static int
 key_escape (struct basht_linebuf *st, unsigned char c, int cycles)
 {
@@ -784,9 +839,20 @@ key_escape (struct basht_linebuf *st, unsigned char c, int cycles)
 	  st->csi_n = st->csi_n2 = 0;
 	  st->csi_more = 0;
 	}
+      else if (c == 'O')
+	st->fs = BF_OSC;	/* SS3: one key byte follows */
       else
 	st->fs = BF_NORMAL;	/* ESC x: swallow both */
-      return 1;
+      return KESC_EAT;
+    }
+  if (st->fs == BF_OSC)
+    {
+      st->fs = BF_NORMAL;
+      if (c == 'A')
+	return KESC_UP;
+      if (c == 'B')
+	return KESC_DOWN;
+      return KESC_EAT;
     }
   if (st->fs == BF_CSI)
     {
@@ -804,16 +870,26 @@ key_escape (struct basht_linebuf *st, unsigned char c, int cycles)
 	  st->fs = BF_NORMAL;
 	  if (cycles && st->csi_n == 1 && st->csi_n2 == 3
 	      && (c == 'C' || c == 'D'))
-	    basht_cycle_owner (c == 'C' ? 1 : -1);
+	    {
+	      basht_cycle_owner (c == 'C' ? 1 : -1);
+	      return KESC_EAT;
+	    }
+	  if (st->csi_n == 0 && st->csi_more == 0)
+	    {
+	      if (c == 'A')
+		return KESC_UP;
+	      if (c == 'B')
+		return KESC_DOWN;
+	    }
 	}
-      return 1;
+      return KESC_EAT;
     }
   if (c == 0x1b)
     {
       st->fs = BF_ESC;
-      return 1;
+      return KESC_EAT;
     }
-  return 0;
+  return KESC_NONE;
 }
 
 static void
@@ -953,6 +1029,7 @@ basht_fg_pump (pid_t pid)
       fg_stdin_open = 1;
       manual_sel = 0;
       fg_ta_esc.fs = BF_NORMAL;
+      ta_hist = -1;
       memset (&ta_rly, 0, sizeof ta_rly);
       strcpy (ta_rly.name, "bash");
       ta_rly.pid = self.pid;
@@ -1037,7 +1114,13 @@ basht_fg_pump (pid_t pid)
 	      for (ssize_t k = 0; k < n; k++)
 		{
 		  unsigned char c = (unsigned char)buf[k];
-		  if (key_escape (&fg_ta_esc, c, 1))
+		  int e = key_escape (&fg_ta_esc, c, 1);
+		  if (e == KESC_UP || e == KESC_DOWN)
+		    {
+		      ta_history (e == KESC_UP ? -1 : 1);
+		      continue;
+		    }
+		  if (e)
 		    continue;
 		  if (c == 0x03)
 		    fg_signal (pid, SIGINT);
@@ -1049,6 +1132,7 @@ basht_fg_pump (pid_t pid)
 			rl_stuff_char ((unsigned char)ta_rly.lb.data[j]);
 		      rl_stuff_char ('\n');
 		      ta_rly.lb.len = ta_rly.lb.cur = 0;
+		      ta_hist = -1;
 		      basht_display_partial (&ta_rly);
 		      basht_display_set_owner (&self);
 		    }
@@ -1110,6 +1194,7 @@ basht_fg_end (void)
   for (i = 0; i < ta_rly.lb.len; i++)
     rl_stuff_char ((unsigned char)ta_rly.lb.data[i]);
   ta_rly.lb.len = ta_rly.lb.cur = 0;
+  ta_hist = -1;
   basht_display_stream_gone (&ta_rly);
   basht_drain ();
 }

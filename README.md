@@ -49,8 +49,9 @@ task 0's unfinished line.
   At the prompt, selection is just a forced instance of the ownership
   rule — the next task to prompt takes the console back. During a
   foreground command the selection holds until the selected task goes
-  away; selecting the shell there turns typing into type-ahead for the
-  next prompt.
+  away; selecting the shell there turns typing into a visible type-ahead
+  line for the next prompt — Up/Down browse the shell history on it, and
+  Enter queues the line to run when the prompt returns.
 - **Serial foreground**: a command run without `&` takes the console like
   stock bash; typing relays to its stdin, `^C`/`^Z` are delivered by
   process group, and background tasks keep printing through the whole
