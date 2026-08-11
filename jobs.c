@@ -4804,7 +4804,16 @@ initialize_job_control (int force)
 	 interactive is set, then this is an interactive shell no
 	 matter where fd 2 is directed. */
       if (shell_tty == -1)
-	shell_tty = dup (fileno (stderr));	/* fd 2 */
+	{
+	  /* basht: fd 2 is the self-pty slave, not the controlling
+	     terminal; job control belongs to the real tty (matters
+	     on re-init, e.g. after a failed exec). */
+	  extern int basht_active, basht_tty;
+	  if (basht_active && basht_tty >= 0)
+	    shell_tty = dup (basht_tty);
+	  else
+	    shell_tty = dup (fileno (stderr));	/* fd 2 */
+	}
 
       if (shell_tty != -1)
 	shell_tty = move_to_high_fd (shell_tty, 1, -1);
