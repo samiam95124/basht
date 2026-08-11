@@ -359,6 +359,40 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
 static void fg_signal (pid_t, int);
 static void basht_cycle_owner (int);
 
+/* The in pty's master carries whatever the tty driver echoes for
+   input basht writes -- nothing else ever appears there. A raw
+   task that left ECHO on (cbreak readers: read -n1, menus) relies
+   on that echo to show the keystroke: feed it through the task's
+   stdout stream. In canonical mode the relay already displayed the
+   line, so the echo is discarded -- but always drained, so the
+   queue cannot back up. */
+static void
+drain_cap_in (struct basht_cap *cp)
+{
+  unsigned char buf[512];
+  struct termios t;
+  int show;
+  ssize_t n;
+
+  if (cp->m_in < 0)
+    return;
+  show = tcgetattr (cp->m_in, &t) == 0
+	 && (t.c_lflag & ICANON) == 0 && (t.c_lflag & ECHO) != 0;
+  for (;;)
+    {
+      n = read (cp->m_in, buf, sizeof buf);
+      if (n > 0)
+	{
+	  if (show)
+	    basht_filter_bytes (&cp->out, buf, (size_t)n, 0);
+	  continue;
+	}
+      if (n < 0 && errno == EINTR)
+	continue;
+      return;			/* EAGAIN; EOF/EIO is out/err's cue */
+    }
+}
+
 /* ---- auto-window: full-screen tasks move to a terminal window ---
 
    When a task enables the alternate screen, basht stops filtering
@@ -649,6 +683,7 @@ drain_caps (void)
 	  if (cp->windowed)	/* moved just now */
 	    continue;
 	  drain_cap_fd (&cp->m_err, &cp->err);
+	  drain_cap_in (cp);
 	}
       /* both output streams gone: the task is over; release */
       if (cp->m_out < 0 && cp->m_err < 0 && cp->m_in >= 0)
@@ -958,6 +993,69 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
     }
 }
 
+/* The task's stdin discipline, read from its in pty (a pty pair
+   shares one termios, so the master sees the slave's settings).
+   Nonzero = non-canonical: the task reads keystrokes, not lines --
+   readline programs (nested shells, ssh, REPLs) live here. ISIG
+   is reported so signal keys can be handled as the tty driver
+   would have. */
+static int
+cap_stdin_raw (struct basht_cap *cp, int *isig)
+{
+  struct termios t;
+
+  if (cp->m_in < 0 || tcgetattr (cp->m_in, &t) < 0)
+    {
+      if (isig)
+	*isig = 1;
+      return 0;
+    }
+  if (isig)
+    *isig = (t.c_lflag & ISIG) != 0;
+  return (t.c_lflag & ICANON) == 0;
+}
+
+/* Raw pass-through (issue #9): the task asked for keystrokes, so
+   it gets them unedited -- escape sequences included; its own echo
+   paints the input line, through the display machinery that
+   already shows its partials. Only basht's console keys
+   (alt-left/right, stripped from the burst) are withheld. While
+   the slave keeps ISIG, ^C/^Z act on the process group exactly as
+   the tty driver would; with ISIG off they forward as bytes. */
+static void
+relay_raw (struct basht_cap *cp, const char *buf, ssize_t n, int isig)
+{
+  ssize_t k = 0, mark = 0;
+
+  while (k < n)
+    {
+      unsigned char c = (unsigned char)buf[k];
+      if (c == 0x1b && k + 5 < n && buf[k + 1] == '[' && buf[k + 2] == '1'
+	  && buf[k + 3] == ';' && buf[k + 4] == '3'
+	  && (buf[k + 5] == 'C' || buf[k + 5] == 'D'))
+	{
+	  if (k > mark && cp->m_in >= 0)
+	    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+	  basht_cycle_owner (buf[k + 5] == 'C' ? 1 : -1);
+	  k += 6;
+	  mark = k;
+	  continue;
+	}
+      if (isig && (c == 0x03 || c == 0x1a))
+	{
+	  if (k > mark && cp->m_in >= 0)
+	    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+	  fg_signal (cp->pid, c == 0x03 ? SIGINT : SIGTSTP);
+	  k += 1;
+	  mark = k;
+	  continue;
+	}
+      k++;
+    }
+  if (k > mark && cp->m_in >= 0)
+    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+}
+
 /* Keyboard target during a foreground episode: the foreground cap
    CP unless a manual selection overrides it and is still valid.
    Returns 0 for the shell (type-ahead). */
@@ -1095,14 +1193,38 @@ basht_fg_pump (pid_t pid)
       else if (n > 0)
 	{
 	  struct basht_cap *tcp = fg_target (cp);
+	  int isig;
 	  if (tcp == cp)
-	    relay_chars (cp, &fg_rly, buf, n, 1);
+	    {
+	      if (cap_stdin_raw (cp, &isig))
+		{
+		  /* line-mode text typed before the task went raw
+		     belongs to the raw reader */
+		  if (fg_rly.lb.len > fg_rly.lb.fix && cp->m_in >= 0)
+		    basht_write_all (cp->m_in,
+				     fg_rly.lb.data + fg_rly.lb.fix,
+				     fg_rly.lb.len - fg_rly.lb.fix);
+		  if (fg_rly.lb.len > 0)
+		    {
+		      fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
+		      basht_display_stream_gone (&fg_rly);
+		    }
+		  relay_raw (cp, buf, n, isig);
+		}
+	      else
+		relay_chars (cp, &fg_rly, buf, n, 1);
+	    }
 	  else if (tcp)
 	    {
 	      /* a background task is selected: same relay the
 		 prompt-time router uses */
-	      prompt_relay_bind (tcp);
-	      relay_chars (tcp, &prompt_rly, buf, n, 1);
+	      if (cap_stdin_raw (tcp, &isig))
+		relay_raw (tcp, buf, n, isig);
+	      else
+		{
+		  prompt_relay_bind (tcp);
+		  relay_chars (tcp, &prompt_rly, buf, n, 1);
+		}
 	    }
 	  else
 	    {
@@ -1553,8 +1675,30 @@ basht_getc (FILE *stream)
 	      ssize_t n = read (fd, buf, sizeof buf);
 	      if (n > 0)
 		{
-		  prompt_relay_bind (cp);
-		  relay_chars (cp, &prompt_rly, buf, n, 1);
+		  int isig;
+		  if (cap_stdin_raw (cp, &isig))
+		    {
+		      /* line-mode text typed before the task went
+			 raw: the raw reader gets those bytes now */
+		      if (rslot == (int)(cp - caps))
+			{
+			  if (prompt_rly.lb.len > prompt_rly.lb.fix
+			      && cp->m_in >= 0)
+			    basht_write_all (cp->m_in,
+				prompt_rly.lb.data + prompt_rly.lb.fix,
+				prompt_rly.lb.len - prompt_rly.lb.fix);
+			  prompt_rly.lb.len = prompt_rly.lb.cur =
+			    prompt_rly.lb.fix = 0;
+			  basht_display_stream_gone (&prompt_rly);
+			  rslot = -1;
+			}
+		      relay_raw (cp, buf, n, isig);
+		    }
+		  else
+		    {
+		      prompt_relay_bind (cp);
+		      relay_chars (cp, &prompt_rly, buf, n, 1);
+		    }
 		  basht_display_sync ();
 		  continue;
 		}
@@ -1582,6 +1726,18 @@ basht_init (void)
 
   if (basht_active || interactive_shell == 0)
     return;
+
+  /* Nested under another basht's capture: BASHT_LEVEL is exported
+     and our terminal is not a controlling tty we can own. Stay
+     plain -- the outer multiplexer displays this shell as a task,
+     and its raw pass-through gives our readline the keyboard. A
+     basht in a real terminal window can acquire the tty and
+     multiplexes as usual. */
+  {
+    const char *lvl = getenv ("BASHT_LEVEL");
+    if (lvl && *lvl && tcgetpgrp (0) < 0)
+      return;
+  }
 
   t = dup (fileno (stderr));
   if (t < 0)
@@ -1656,6 +1812,21 @@ basht_init (void)
       {
 	dbglog = fopen (p, "a");
 	dbg ("=== basht %d up ===", (int)getpid ());
+      }
+  }
+
+  /* SHLVL-style nesting witness, for the guard above */
+  {
+    const char *lvl = getenv ("BASHT_LEVEL");
+    char buf[16];
+    SHELL_VAR *v;
+
+    snprintf (buf, sizeof buf, "%d", (lvl ? atoi (lvl) : 0) + 1);
+    v = bind_variable ("BASHT_LEVEL", buf, 0);
+    if (v)
+      {
+	VSETATTR (v, att_exported);
+	array_needs_making = 1;
       }
   }
 
