@@ -1,0 +1,53 @@
+name: Bug report
+description: Something misbehaved — a display glitch, lost input, a task handled wrongly
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead. Paste terminal output if you can — the tagged lines usually tell the story.
+      placeholder: |
+        Typed `make` while ping ran in the background; the first character
+        of the command was dropped...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Best-effort is fine — timing bugs are welcome even without a reliable recipe.
+      placeholder: |
+        1. ping google.com &
+        2. type a command while output is streaming
+        3. ...
+  - type: input
+    id: version
+    attributes:
+      label: basht version
+      description: Release tag, or `git rev-parse --short HEAD` if built from a clone.
+      placeholder: v0.2
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you got it
+      options:
+        - Release binary (static tarball)
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator and OS
+      placeholder: gnome-terminal 3.36, Ubuntu 20.04
+  - type: textarea
+    id: trace
+    attributes:
+      label: BASHT_DEBUG trace (for input problems)
+      description: >
+        If input was lost or garbled: run `BASHT_DEBUG=/tmp/basht.log basht`,
+        reproduce, and paste the last ~30 lines of the log here.
+      render: text
