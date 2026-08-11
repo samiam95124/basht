@@ -43,6 +43,14 @@ task 0's unfinished line.
   terminal; Enter ships the typed part to its stdin and completes the
   line. When it finishes its line, the console reverts to the shell and
   any half-typed input becomes type-ahead at the prompt.
+- **The relay follows the task's own line discipline**: basht reads each
+  task's stdin termios off its pty. Canonical readers (`fgets`, `read`)
+  get the edited line relay above; a task that goes raw — nested shells,
+  `ssh`, `sudo -i`, every readline REPL (`python`, `gdb`, `psql`) — gets
+  keystrokes passed straight through, so its own editing, history, and
+  completion work natively, painted by its own echo. A nested basht
+  detects the outer one (`$BASHT_LEVEL`) and runs plain rather than
+  double-multiplexing.
 - **Alt-Left/Right cycles the inputting tasks**: every task currently
   mid-line, the shell included, in a ring — at the prompt and during a
   foreground command alike (the foreground task is always in the ring).
@@ -105,7 +113,9 @@ Non-interactive shells and scripts are untouched: `bash -c`, cron jobs and
 Line-oriented commands are the point; full-screen programs belong in their
 windows. Window resize after attach isn't propagated; pipeline stdin relay
 goes to the last stage; task ids are basht's own, not bash's `%n` job
-numbers; very long entry lines wrap and erase imperfectly.
+numbers; very long entry lines wrap and erase imperfectly. Nested shells
+run without job control (a capture pty is not a controlling terminal) —
+a shell that needs it belongs in a window.
 
 ## License
 
