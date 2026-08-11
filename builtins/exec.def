@@ -228,8 +228,21 @@ exec_builtin (WORD_LIST *list)
   if (default_buffered_input >= 0)
     sync_buffered_stream (default_buffered_input);
 
+  /* basht: the new image must not inherit the self-pty slave on
+     fds 1/2 -- its master dies with this image. Real tty goes on;
+     if the exec fails the slave comes back below. */
+  {
+    extern void basht_exec_prepare (void);
+    basht_exec_prepare ();
+  }
+
   exit_value = shell_execve (command, args, env);
   opt = errno;
+
+  {
+    extern void basht_exec_failed (void);
+    basht_exec_failed ();
+  }
 
   if (cleanenv == 0)
     adjust_shell_level (1);

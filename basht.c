@@ -1250,6 +1250,52 @@ basht_init (void)
   basht_active = 1;
 }
 
+/* The exec builtin is about to replace this shell (issue #5): fds
+   1/2 hold the self-pty slave, whose master dies with this image
+   (FD_CLOEXEC), so anything the exec'd program writes there is
+   lost -- an exec'd basht would wire its whole display into the
+   dead pty. Put the real terminal back on 1/2; the exec'd program
+   starts as if launched from a plain terminal. Saved dups (also
+   close-on-exec) let a failed exec put the slave back, since the
+   shell lives on. No-op in subshells: their fds are the child
+   plumbing basht_child_stdio already arranged. */
+static int exec_save_out = -1, exec_save_err = -1;
+
+void
+basht_exec_prepare (void)
+{
+  if (basht_active == 0 || basht_tty < 0 || getpid () != self.pid)
+    return;
+  basht_drain ();
+  fflush (stdout);
+  fflush (stderr);
+  exec_save_out = fcntl (1, F_DUPFD_CLOEXEC, 10);
+  exec_save_err = fcntl (2, F_DUPFD_CLOEXEC, 10);
+  dup2 (basht_tty, 1);
+  dup2 (basht_tty, 2);
+  dbg ("exec_prepare: real tty on 1/2");
+}
+
+void
+basht_exec_failed (void)
+{
+  if (basht_active == 0 || getpid () != self.pid)
+    return;
+  if (exec_save_out >= 0)
+    {
+      dup2 (exec_save_out, 1);
+      close (exec_save_out);
+      exec_save_out = -1;
+    }
+  if (exec_save_err >= 0)
+    {
+      dup2 (exec_save_err, 2);
+      close (exec_save_err);
+      exec_save_err = -1;
+    }
+  dbg ("exec_failed: pty slave restored on 1/2");
+}
+
 /* In a forked child (phase 1): put the real terminal back on fds
    1/2 so external commands behave exactly as in stock bash. Pipes
    and redirections are applied by the caller afterward and override
