@@ -44,9 +44,13 @@ task 0's unfinished line.
   line. When it finishes its line, the console reverts to the shell and
   any half-typed input becomes type-ahead at the prompt.
 - **Alt-Left/Right cycles the inputting tasks**: every task currently
-  mid-line, the shell's own prompt included, in a ring. Selection is just
-  a forced instance of the ownership rule — the next task to prompt takes
-  the console back.
+  mid-line, the shell included, in a ring — at the prompt and during a
+  foreground command alike (the foreground task is always in the ring).
+  At the prompt, selection is just a forced instance of the ownership
+  rule — the next task to prompt takes the console back. During a
+  foreground command the selection holds until the selected task goes
+  away; selecting the shell there turns typing into type-ahead for the
+  next prompt.
 - **Serial foreground**: a command run without `&` takes the console like
   stock bash; typing relays to its stdin, `^C`/`^Z` are delivered by
   process group, and background tasks keep printing through the whole

@@ -698,6 +698,20 @@ static int   fg_stdin_open = 1;
 static pid_t fg_pid = -1;
 static BASHT_STREAM fg_rly;
 
+/* Manual keyboard selection (alt-arrows) during a foreground
+   episode: 0 = the foreground task (the default), &self = the
+   shell (keystrokes become readline type-ahead for the next
+   prompt), else a background task's stream. Validated against the
+   caps table on every use; reset at episode boundaries. */
+static const BASHT_STREAM *manual_sel;
+static pid_t manual_sel_pid;
+static struct basht_linebuf fg_ta_esc;	/* type-ahead escape state */
+
+/* the prompt-time relay, defined with its router further down */
+static BASHT_STREAM prompt_rly;
+static int rslot;
+static void prompt_relay_bind (struct basht_cap *);
+
 static void
 fg_signal (pid_t pid, int sig)
 {
@@ -749,6 +763,54 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
    is set (prompt-time relay) alt-left/right (CSI 1;3 D/C) cycle
    the console between the inputting tasks. Shared by the
    foreground pump and the prompt-time relay. */
+/* Escape-sequence scanner shared by every keyboard sink: sequences
+   are swallowed, never typed into a line; alt-left/right (CSI 1;3
+   D/C) cycle the console when CYCLES is set. ST holds the parse
+   state (only fs and the csi fields are used). Returns 1 if C was
+   consumed as part of a sequence. */
+static int
+key_escape (struct basht_linebuf *st, unsigned char c, int cycles)
+{
+  if (st->fs == BF_ESC)
+    {
+      if (c == '[')
+	{
+	  st->fs = BF_CSI;
+	  st->csi_n = st->csi_n2 = 0;
+	  st->csi_more = 0;
+	}
+      else
+	st->fs = BF_NORMAL;	/* ESC x: swallow both */
+      return 1;
+    }
+  if (st->fs == BF_CSI)
+    {
+      if (c >= '0' && c <= '9')
+	{
+	  if (st->csi_more)
+	    st->csi_n2 = st->csi_n2 * 10 + (c - '0');
+	  else
+	    st->csi_n = st->csi_n * 10 + (c - '0');
+	}
+      else if (c == ';')
+	st->csi_more = 1;
+      else if (c >= 0x40 && c <= 0x7e)
+	{
+	  st->fs = BF_NORMAL;
+	  if (cycles && st->csi_n == 1 && st->csi_n2 == 3
+	      && (c == 'C' || c == 'D'))
+	    basht_cycle_owner (c == 'C' ? 1 : -1);
+	}
+      return 1;
+    }
+  if (c == 0x1b)
+    {
+      st->fs = BF_ESC;
+      return 1;
+    }
+  return 0;
+}
+
 static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	     const char *buf, ssize_t n, int cycles)
@@ -756,43 +818,8 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
   for (ssize_t k = 0; k < n; k++)
     {
       unsigned char c = (unsigned char)buf[k];
-      if (rly->lb.fs == BF_ESC)
-	{
-	  if (c == '[')
-	    {
-	      rly->lb.fs = BF_CSI;
-	      rly->lb.csi_n = rly->lb.csi_n2 = 0;
-	      rly->lb.csi_more = 0;
-	    }
-	  else
-	    rly->lb.fs = BF_NORMAL;	/* ESC x: swallow both */
-	  continue;
-	}
-      if (rly->lb.fs == BF_CSI)
-	{
-	  if (c >= '0' && c <= '9')
-	    {
-	      if (rly->lb.csi_more)
-		rly->lb.csi_n2 = rly->lb.csi_n2 * 10 + (c - '0');
-	      else
-		rly->lb.csi_n = rly->lb.csi_n * 10 + (c - '0');
-	    }
-	  else if (c == ';')
-	    rly->lb.csi_more = 1;
-	  else if (c >= 0x40 && c <= 0x7e)
-	    {
-	      rly->lb.fs = BF_NORMAL;
-	      if (cycles && rly->lb.csi_n == 1 && rly->lb.csi_n2 == 3
-		  && (c == 'C' || c == 'D'))
-		basht_cycle_owner (c == 'C' ? 1 : -1);
-	    }
-	  continue;
-	}
-      if (c == 0x1b)
-	{
-	  rly->lb.fs = BF_ESC;
-	  continue;
-	}
+      if (key_escape (&rly->lb, c, cycles))
+	continue;
       if (c == 0x03)		/* ^C */
 	fg_signal (cp->pid, SIGINT);
       else if (c == 0x1a)		/* ^Z */
@@ -850,6 +877,31 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
     }
 }
 
+/* Keyboard target during a foreground episode: the foreground cap
+   CP unless a manual selection overrides it and is still valid.
+   Returns 0 for the shell (type-ahead). */
+static struct basht_cap *
+fg_target (struct basht_cap *cp)
+{
+  int i;
+
+  if (manual_sel == 0)
+    return cp;
+  if (manual_sel == &self)
+    return 0;
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      struct basht_cap *bp = &caps[i];
+      if ((manual_sel == &bp->out || manual_sel == &bp->err)
+	  && bp->pid == manual_sel_pid && bp->out.id != 0
+	  && bp->m_in >= 0
+	  && (bp == cp || bp->out.lb.len > 0 || bp->err.lb.len > 0))
+	return bp;
+    }
+  manual_sel = 0;		/* the selected task went away */
+  return cp;
+}
+
 int
 basht_fg_pump (pid_t pid)
 {
@@ -894,6 +946,8 @@ basht_fg_pump (pid_t pid)
       dbg ("fg episode start pid=%d", (int)pid);
       fg_pid = pid;
       fg_stdin_open = 1;
+      manual_sel = 0;
+      fg_ta_esc.fs = BF_NORMAL;
       memset (&fg_rly, 0, sizeof fg_rly);
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
@@ -952,8 +1006,37 @@ basht_fg_pump (pid_t pid)
 	    basht_write_all (cp->m_in, &e, 1);
 	  fg_stdin_open = 0;
 	}
-      else
-	relay_chars (cp, &fg_rly, buf, n, 0);
+      else if (n > 0)
+	{
+	  struct basht_cap *tcp = fg_target (cp);
+	  if (tcp == cp)
+	    relay_chars (cp, &fg_rly, buf, n, 1);
+	  else if (tcp)
+	    {
+	      /* a background task is selected: same relay the
+		 prompt-time router uses */
+	      prompt_relay_bind (tcp);
+	      relay_chars (tcp, &prompt_rly, buf, n, 1);
+	    }
+	  else
+	    {
+	      /* the shell is selected: keystrokes become readline
+		 type-ahead for the next prompt; job-control keys
+		 still act on the foreground job (ISIG is off) */
+	      for (ssize_t k = 0; k < n; k++)
+		{
+		  unsigned char c = (unsigned char)buf[k];
+		  if (key_escape (&fg_ta_esc, c, 1))
+		    continue;
+		  if (c == 0x03)
+		    fg_signal (pid, SIGINT);
+		  else if (c == 0x1a)
+		    fg_signal (pid, SIGTSTP);
+		  else
+		    rl_stuff_char (c);
+		}
+	    }
+	}
     }
 
   basht_drain ();
@@ -978,6 +1061,8 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
+  manual_sel = 0;
+  fg_ta_esc.fs = BF_NORMAL;
   if (fg_rly.lb.len > fg_rly.lb.fix)
     dbg ("fg_end stuff-back %d chars '%.*s'",
 	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
@@ -1024,8 +1109,9 @@ basht_send_input (const char *name, int inst, const char *text)
    The shell's own prompt is just task 0's incomplete line -- the
    shell lives by the same rule. */
 
-static BASHT_STREAM prompt_rly;
-static int rslot = -1;		/* caps[] slot the relay is bound to */
+/* prompt_rly and rslot (the caps[] slot the relay is bound to,
+   -1 = none) are declared with the foreground pump state above;
+   rslot is set to -1 at init. */
 
 /* The captured task, if any, that should receive keystrokes typed
    while readline is reading: the bottom-line owner's task, while it
@@ -1109,37 +1195,47 @@ prompt_relay_bind (struct basht_cap *cp)
 }
 
 /* Alt-Left/Right: cycle the console between the inputting tasks --
-   every stream currently mid-line, the shell's own prompt included
-   (the shell is always inputting while readline reads). Selection
-   is a forced instance of the ownership rule; the next task to
-   write on an incomplete line steals the console back as usual. */
+   every stream currently mid-line, the shell included (always
+   inputting while readline reads; during a foreground episode it
+   takes keystrokes as type-ahead for the next prompt). The
+   foreground task is always in the ring, prompt or not. At the
+   prompt, selection is a forced instance of the ownership rule and
+   the next task to write on an incomplete line steals the console
+   back; during a foreground episode the selection holds until the
+   selected task goes away or the episode ends. */
 static void
 basht_cycle_owner (int dir)
 {
   const BASHT_STREAM *own = basht_display_owner ();
   const BASHT_STREAM *cand[BASHT_MAX_CAPS + 1];
   int slot[BASHT_MAX_CAPS + 1];
+  int in_fg = fg_pid > 0;
   int n = 0, cur = -1, next, i;
 
-  /* the shell first: bot == 0 means input already goes to
-     readline, so it counts as the shell's position */
-  cand[n] = self.lb.len > 0 ? &self : 0;
+  /* the shell first: at the prompt, bot == 0 means input already
+     goes to readline, so it counts as the shell's position */
+  cand[n] = &self;
   slot[n] = -1;
-  if (own == 0 || own == &self)
+  if (in_fg ? manual_sel == &self : (own == 0 || own == &self))
     cur = n;
   n++;
 
   for (i = 0; i < BASHT_MAX_CAPS; i++)
     {
       struct basht_cap *cp = &caps[i];
+      int is_fg = in_fg && cp->pid == fg_pid;
       if (cp->out.id == 0 || cp->m_in < 0 || cp->windowed || cp->w_was)
 	continue;
-      if (cp->out.lb.len == 0 && cp->err.lb.len == 0)
+      if (is_fg == 0 && cp->out.lb.len == 0 && cp->err.lb.len == 0)
 	continue;
-      cand[n] = cp->out.lb.len > 0 ? &cp->out : &cp->err;
+      cand[n] = cp->out.lb.len > 0 ? &cp->out
+	      : cp->err.lb.len > 0 ? &cp->err : &cp->out;
       slot[n] = i;
-      if (own == &cp->out || own == &cp->err
-	  || (own == &prompt_rly && rslot == i))
+      if (in_fg
+	  ? (manual_sel ? manual_sel == &cp->out || manual_sel == &cp->err
+			: is_fg)
+	  : (own == &cp->out || own == &cp->err
+	     || (own == &prompt_rly && rslot == i)))
 	cur = n;
       n++;
     }
@@ -1160,6 +1256,8 @@ basht_cycle_owner (int dir)
       rslot = -1;
     }
 
+  manual_sel = cand[next];
+  manual_sel_pid = slot[next] < 0 ? -1 : caps[slot[next]].pid;
   dbg ("cycle owner %+d -> %s", dir,
        slot[next] < 0 ? "bash" : caps[slot[next]].out.name);
   basht_display_set_owner (cand[next]);
@@ -1351,6 +1449,7 @@ basht_init (void)
       strcpy (self_exe, "bash");
   }
 
+  rslot = -1;
   rl_getc_function = basht_getc;
   rl_bind_keyseq ("\033[1;3C", rl_basht_cycle_right);	/* alt-right */
   rl_bind_keyseq ("\033[1;3D", rl_basht_cycle_left);	/* alt-left  */
