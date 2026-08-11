@@ -389,10 +389,11 @@ main (int argc, char **argv, char **env)
 
   /* basht: when spawned inside a terminal window as the bridge for
      a full-screen task, we are not a shell at all. */
-  if (argc >= 4 && strcmp (argv[1], "--basht-bridge") == 0)
+  if (argc >= 5 && strcmp (argv[1], "--basht-bridge") == 0)
     {
-      extern int basht_bridge_main (const char *, const char *);
-      exit (basht_bridge_main (argv[2], argv[3]));
+      extern int basht_bridge_main (const char *, const char *,
+				    const char *);
+      exit (basht_bridge_main (argv[2], argv[3], argv[4]));
     }
 
   USE_VAR(argc);

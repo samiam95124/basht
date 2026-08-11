@@ -96,7 +96,10 @@ struct basht_cap {
   int    w_was;			/* has been windowed: the console
 				   keyboard relay stays released   */
   int    w_out, w_in;		/* fifos: to bridge / from bridge  */
-  int    w_need_ws;		/* awaiting 4-byte winsize header  */
+  int    w_ws;			/* fifo: winsize reports, 4 bytes
+				   each, at bridge startup and on
+				   every window resize             */
+  int    w_up;			/* first report seen: bridge is up */
   int    w_hinted;		/* windowing failed; hint printed  */
   char   wdir[64];		/* mkdtemp dir holding the fifos   */
   size_t nbytes;		/* total stdout bytes read         */
@@ -195,13 +198,17 @@ cap_window_close (struct basht_cap *cp)
     close (cp->w_out);
   if (cp->w_in >= 0)
     close (cp->w_in);
-  cp->w_out = cp->w_in = -1;
+  if (cp->w_ws >= 0)
+    close (cp->w_ws);
+  cp->w_out = cp->w_in = cp->w_ws = -1;
   cp->windowed = 0;
   if (cp->wdir[0])
     {
       snprintf (path, sizeof path, "%s/o", cp->wdir);
       unlink (path);
       snprintf (path, sizeof path, "%s/i", cp->wdir);
+      unlink (path);
+      snprintf (path, sizeof path, "%s/w", cp->wdir);
       unlink (path);
       rmdir (cp->wdir);
       cp->wdir[0] = '\0';
@@ -262,7 +269,7 @@ basht_fork_prepare (const char *command, int flags)
 
   memset (cp, 0, sizeof *cp);
   cp->pid = -1;
-  cp->w_out = cp->w_in = -1;
+  cp->w_out = cp->w_in = cp->w_ws = -1;
   cp->m_in = open_master (pend_sin, sizeof pend_sin);
   cp->m_out = open_master (pend_sout, sizeof pend_sout);
   cp->m_err = open_master (pend_serr, sizeof pend_serr);
@@ -271,6 +278,18 @@ basht_fork_prepare (const char *command, int flags)
       cap_free (cp);
       return;
     }
+
+  /* a console task starts at the real terminal's size */
+  {
+    struct winsize ws;
+    if (basht_tty >= 0 && ioctl (basht_tty, TIOCGWINSZ, &ws) == 0
+	&& ws.ws_row > 0)
+      {
+	ioctl (cp->m_in, TIOCSWINSZ, &ws);
+	ioctl (cp->m_out, TIOCSWINSZ, &ws);
+	ioctl (cp->m_err, TIOCSWINSZ, &ws);
+      }
+  }
 
   cap_name (command, cp->out.name, sizeof cp->out.name);
   if (cp->out.name[0] == '(')	/* subshell command text */
@@ -358,6 +377,7 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
 
 static void fg_signal (pid_t, int);
 static void basht_cycle_owner (int);
+static pid_t fg_pid;		/* defined with the fg pump below */
 
 /* The in pty's master carries whatever the tty driver echoes for
    input basht writes -- nothing else ever appears there. A raw
@@ -443,7 +463,7 @@ scrub_queries (const unsigned char *in, size_t n, unsigned char *out)
 static int
 window_try (struct basht_cap *cp)
 {
-  char fo[96], fi[96];
+  char fo[96], fi[96], fw[96];
   char termbuf[256];
   char *targv[16];
   int ntargv;
@@ -475,24 +495,28 @@ window_try (struct basht_cap *cp)
     }
   snprintf (fo, sizeof fo, "%s/o", cp->wdir);
   snprintf (fi, sizeof fi, "%s/i", cp->wdir);
-  if (mkfifo (fo, 0600) < 0 || mkfifo (fi, 0600) < 0)
+  snprintf (fw, sizeof fw, "%s/w", cp->wdir);
+  if (mkfifo (fo, 0600) < 0 || mkfifo (fi, 0600) < 0
+      || mkfifo (fw, 0600) < 0)
     {
       cap_window_close (cp);
       return 0;
     }
   /* O_RDWR on the outbound fifo: never blocks at open, and since we
      hold a reader it can never raise SIGPIPE at us; the bridge
-     still sees EOF when we close it. Inbound is a plain
-     nonblocking reader. */
+     still sees EOF when we close it. Inbound (keyboard) and winsize
+     are plain nonblocking readers. */
   cp->w_out = open (fo, O_RDWR | O_NONBLOCK);
   cp->w_in = open (fi, O_RDONLY | O_NONBLOCK);
-  if (cp->w_out < 0 || cp->w_in < 0)
+  cp->w_ws = open (fw, O_RDONLY | O_NONBLOCK);
+  if (cp->w_out < 0 || cp->w_in < 0 || cp->w_ws < 0)
     {
       cap_window_close (cp);
       return 0;
     }
   fcntl (cp->w_out, F_SETFD, FD_CLOEXEC);
   fcntl (cp->w_in, F_SETFD, FD_CLOEXEC);
+  fcntl (cp->w_ws, F_SETFD, FD_CLOEXEC);
 
   /* terminal command: split on blanks, append bridge invocation */
   strncpy (termbuf, termcmd, sizeof termbuf - 1);
@@ -505,6 +529,7 @@ window_try (struct basht_cap *cp)
   targv[ntargv++] = (char *)"--basht-bridge";
   targv[ntargv++] = fo;
   targv[ntargv++] = fi;
+  targv[ntargv++] = fw;
   targv[ntargv] = 0;
 
   wpid = fork ();
@@ -526,54 +551,63 @@ window_try (struct basht_cap *cp)
 
   cp->windowed = 1;
   cp->w_was = 1;
-  cp->w_need_ws = 1;
   basht_display_event (&cp->out, "full screen: moved to a window");
   return 1;
 }
 
-/* Shuttle for a windowed task: window keyboard -> task stdin
-   (after the 4-byte winsize header), task stdout/stderr -> window,
-   gated on fifo room so a stalled window backs up into the kernel
-   pty queue instead of into basht. */
+/* Shuttle for a windowed task: window keyboard -> task stdin,
+   winsize reports -> TIOCSWINSZ + SIGWINCH (at bridge startup and
+   on every window resize), task stdout/stderr -> window, gated on
+   fifo room so a stalled window backs up into the kernel pty queue
+   instead of into basht. */
 static void
 shuttle_windowed (struct basht_cap *cp)
 {
   unsigned char buf[2048];
   ssize_t n;
 
-  /* keyboard and winsize from the bridge */
+  /* winsize reports: 4 bytes each, latest wins; the first one is
+     also the sign the bridge is up */
+  while (cp->w_ws >= 0)
+    {
+      unsigned char wsb[4];
+      n = read (cp->w_ws, wsb, sizeof wsb);
+      if (n == 4)
+	{
+	  struct winsize ws;
+	  memset (&ws, 0, sizeof ws);
+	  ws.ws_row = (wsb[0] << 8) | wsb[1];
+	  ws.ws_col = (wsb[2] << 8) | wsb[3];
+	  if (ws.ws_row > 0 && ws.ws_col > 0)
+	    {
+	      ioctl (cp->m_in, TIOCSWINSZ, &ws);
+	      ioctl (cp->m_out, TIOCSWINSZ, &ws);
+	      ioctl (cp->m_err, TIOCSWINSZ, &ws);
+	      fg_signal (cp->pid, SIGWINCH);
+	    }
+	  cp->w_up = 1;
+	  continue;
+	}
+      if (n < 0 && errno == EINTR)
+	continue;
+      break;			/* EAGAIN, EOF, or short read */
+    }
+
+  /* keyboard from the bridge */
   while (cp->w_in >= 0)
     {
       n = read (cp->w_in, buf, sizeof buf);
       if (n > 0)
 	{
-	  unsigned char *p = buf;
-	  if (cp->w_need_ws && n >= 4)
-	    {
-	      struct winsize ws;
-	      memset (&ws, 0, sizeof ws);
-	      ws.ws_row = (buf[0] << 8) | buf[1];
-	      ws.ws_col = (buf[2] << 8) | buf[3];
-	      if (ws.ws_row > 0 && ws.ws_col > 0)
-		{
-		  ioctl (cp->m_in, TIOCSWINSZ, &ws);
-		  ioctl (cp->m_out, TIOCSWINSZ, &ws);
-		  ioctl (cp->m_err, TIOCSWINSZ, &ws);
-		  fg_signal (cp->pid, SIGWINCH);
-		}
-	      cp->w_need_ws = 0;
-	      p += 4;
-	      n -= 4;
-	    }
-	  if (n > 0 && cp->m_in >= 0)
-	    basht_write_all (cp->m_in, p, (size_t)n);
+	  if (cp->m_in >= 0)
+	    basht_write_all (cp->m_in, buf, (size_t)n);
 	  continue;
 	}
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 	break;
       if (n < 0 && errno == EINTR)
 	continue;
-      if (n == 0 && cp->w_need_ws)
+      if (n == 0 && cp->w_up == 0)
 	break;			/* bridge not connected yet */
       /* window closed: hang up the task; if it survives, its
 	 output returns to the tagged console */
@@ -700,6 +734,39 @@ basht_drain (void)
      re-read like the prompt strings are: a change shows on the
      next line displayed */
   basht_display_set_tagfmt (get_string_value ("PST1"));
+
+  /* real-terminal resize: mirror onto the self pty and every
+     console task's trio; the foreground task also gets the
+     SIGWINCH the tty driver would have sent it (windowed tasks
+     size from their own window instead) */
+  {
+    static struct winsize last;
+    struct winsize ws;
+
+    if (ioctl (basht_tty, TIOCGWINSZ, &ws) == 0
+	&& ws.ws_row > 0 && ws.ws_col > 0
+	&& (ws.ws_row != last.ws_row || ws.ws_col != last.ws_col))
+      {
+	last = ws;
+	if (self_master >= 0)
+	  ioctl (self_master, TIOCSWINSZ, &ws);
+	for (int i = 0; i < BASHT_MAX_CAPS; i++)
+	  {
+	    struct basht_cap *cp = &caps[i];
+	    if (cp->out.id == 0 || cp->windowed || cp->w_was)
+	      continue;
+	    if (cp->m_in >= 0)
+	      ioctl (cp->m_in, TIOCSWINSZ, &ws);
+	    if (cp->m_out >= 0)
+	      ioctl (cp->m_out, TIOCSWINSZ, &ws);
+	    if (cp->m_err >= 0)
+	      ioctl (cp->m_err, TIOCSWINSZ, &ws);
+	    if (cp->pid > 0 && cp->pid == fg_pid)
+	      fg_signal (cp->pid, SIGWINCH);
+	  }
+      }
+  }
+
   fflush (stdout);
   fflush (stderr);
   drain_self ();
@@ -1792,7 +1859,7 @@ basht_init (void)
   for (int i = 0; i < BASHT_MAX_CAPS; i++)
     {
       caps[i].m_in = caps[i].m_out = caps[i].m_err = -1;
-      caps[i].w_out = caps[i].w_in = -1;
+      caps[i].w_out = caps[i].w_in = caps[i].w_ws = -1;
       caps[i].pid = -1;
     }
 
@@ -1926,26 +1993,56 @@ basht_child_stdio (void)
 /* ---- --basht-bridge: runs inside the spawned terminal window ----
 
    The window is a viewport onto a task that keeps running on
-   basht's ptys. This end goes raw, reports its window size (4-byte
-   header), then shuttles: fifo from basht -> our stdout (the real
-   terminal draws it), our keyboard -> fifo to basht. Exits when
-   basht closes the outbound fifo (task ended), which closes the
-   window. */
-int
-basht_bridge_main (const char *opath, const char *ipath)
+   basht's ptys. This end goes raw, reports its window size (4
+   bytes on the winsize fifo, at startup and again on every
+   SIGWINCH -- the resize follows the task), then shuttles: fifo
+   from basht -> our stdout (the real terminal draws it), our
+   keyboard -> fifo to basht. Exits when basht closes the outbound
+   fifo (task ended), which closes the window. */
+
+static volatile sig_atomic_t bridge_winch;
+
+static void
+bridge_sigwinch (int sig)
 {
-  int ofd, ifd, r;
-  struct termios save, t;
-  int have_tio;
+  bridge_winch = 1;
+}
+
+static void
+bridge_send_ws (int wfd)
+{
   struct winsize ws;
   unsigned char hdr[4];
+
+  memset (&ws, 0, sizeof ws);
+  if (ioctl (0, TIOCGWINSZ, &ws) < 0 || ws.ws_row == 0)
+    {
+      ws.ws_row = 24;
+      ws.ws_col = 80;
+    }
+  hdr[0] = ws.ws_row >> 8;
+  hdr[1] = ws.ws_row & 0xff;
+  hdr[2] = ws.ws_col >> 8;
+  hdr[3] = ws.ws_col & 0xff;
+  basht_write_all (wfd, hdr, 4);
+}
+
+int
+basht_bridge_main (const char *opath, const char *ipath,
+		   const char *wpath)
+{
+  int ofd, ifd, wfd, r;
+  struct termios save, t;
+  int have_tio;
   unsigned char buf[4096];
   ssize_t n;
 
   signal (SIGPIPE, SIG_IGN);
+  signal (SIGWINCH, bridge_sigwinch);
   ofd = open (opath, O_RDONLY | O_NONBLOCK);
   ifd = open (ipath, O_WRONLY);
-  if (ofd < 0 || ifd < 0)
+  wfd = open (wpath, O_WRONLY);
+  if (ofd < 0 || ifd < 0 || wfd < 0)
     return 1;
   fcntl (ofd, F_SETFL, 0);	/* back to blocking */
 
@@ -1960,21 +2057,16 @@ basht_bridge_main (const char *opath, const char *ipath)
       tcsetattr (0, TCSANOW, &t);
     }
 
-  memset (&ws, 0, sizeof ws);
-  if (ioctl (0, TIOCGWINSZ, &ws) < 0 || ws.ws_row == 0)
-    {
-      ws.ws_row = 24;
-      ws.ws_col = 80;
-    }
-  hdr[0] = ws.ws_row >> 8;
-  hdr[1] = ws.ws_row & 0xff;
-  hdr[2] = ws.ws_col >> 8;
-  hdr[3] = ws.ws_col & 0xff;
-  basht_write_all (ifd, hdr, 4);
+  bridge_send_ws (wfd);
 
   for (;;)
     {
       fd_set rf;
+      if (bridge_winch)
+	{
+	  bridge_winch = 0;
+	  bridge_send_ws (wfd);
+	}
       FD_ZERO (&rf);
       FD_SET (0, &rf);
       FD_SET (ofd, &rf);
@@ -1982,7 +2074,7 @@ basht_bridge_main (const char *opath, const char *ipath)
       if (r < 0)
 	{
 	  if (errno == EINTR)
-	    continue;
+	    continue;		/* SIGWINCH lands here */
 	  break;
 	}
       if (FD_ISSET (ofd, &rf))
