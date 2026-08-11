@@ -706,6 +706,11 @@ static BASHT_STREAM fg_rly;
 static const BASHT_STREAM *manual_sel;
 static pid_t manual_sel_pid;
 static struct basht_linebuf fg_ta_esc;	/* type-ahead escape state */
+static BASHT_STREAM ta_rly;	/* the shell's visible type-ahead
+				   line: typed while the shell is
+				   selected during a foreground
+				   episode, queued to readline on
+				   Enter (and at episode end) */
 
 /* the prompt-time relay, defined with its router further down */
 static BASHT_STREAM prompt_rly;
@@ -948,6 +953,10 @@ basht_fg_pump (pid_t pid)
       fg_stdin_open = 1;
       manual_sel = 0;
       fg_ta_esc.fs = BF_NORMAL;
+      memset (&ta_rly, 0, sizeof ta_rly);
+      strcpy (ta_rly.name, "bash");
+      ta_rly.pid = self.pid;
+      ta_rly.lines = self.lines;
       memset (&fg_rly, 0, sizeof fg_rly);
       strcpy (fg_rly.name, cp->out.name);
       fg_rly.id = cp->out.id;
@@ -1020,9 +1029,11 @@ basht_fg_pump (pid_t pid)
 	    }
 	  else
 	    {
-	      /* the shell is selected: keystrokes become readline
-		 type-ahead for the next prompt; job-control keys
-		 still act on the foreground job (ISIG is off) */
+	      /* the shell is selected: typing builds a visible
+		 pending line, queued to readline as type-ahead on
+		 Enter -- it echoes and runs when the prompt
+		 returns. Job-control keys still act on the
+		 foreground job (ISIG is off). */
 	      for (ssize_t k = 0; k < n; k++)
 		{
 		  unsigned char c = (unsigned char)buf[k];
@@ -1032,8 +1043,30 @@ basht_fg_pump (pid_t pid)
 		    fg_signal (pid, SIGINT);
 		  else if (c == 0x1a)
 		    fg_signal (pid, SIGTSTP);
-		  else
-		    rl_stuff_char (c);
+		  else if (c == '\r' || c == '\n')
+		    {
+		      for (size_t j = 0; j < ta_rly.lb.len; j++)
+			rl_stuff_char ((unsigned char)ta_rly.lb.data[j]);
+		      rl_stuff_char ('\n');
+		      ta_rly.lb.len = ta_rly.lb.cur = 0;
+		      basht_display_partial (&ta_rly);
+		      basht_display_set_owner (&self);
+		    }
+		  else if (c == 0x7f || c == '\b')
+		    {
+		      if (ta_rly.lb.len > 0)
+			ta_rly.lb.cur = --ta_rly.lb.len;
+		      basht_display_partial (&ta_rly);
+		    }
+		  else if (c == '\t' || c >= 0x20)
+		    {
+		      if (ta_rly.lb.len < BASHT_LINEBUF_CAP - 2)
+			{
+			  ta_rly.lb.data[ta_rly.lb.len++] = (char)c;
+			  ta_rly.lb.cur = ta_rly.lb.len;
+			}
+		      basht_display_partial (&ta_rly);
+		    }
 		}
 	    }
 	}
@@ -1072,6 +1105,12 @@ basht_fg_end (void)
     rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
   fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
   basht_display_stream_gone (&fg_rly);
+  /* a half-typed shell line queues too: it reappears, editable,
+     at the prompt about to be drawn */
+  for (i = 0; i < ta_rly.lb.len; i++)
+    rl_stuff_char ((unsigned char)ta_rly.lb.data[i]);
+  ta_rly.lb.len = ta_rly.lb.cur = 0;
+  basht_display_stream_gone (&ta_rly);
   basht_drain ();
 }
 
@@ -1260,7 +1299,24 @@ basht_cycle_owner (int dir)
   manual_sel_pid = slot[next] < 0 ? -1 : caps[slot[next]].pid;
   dbg ("cycle owner %+d -> %s", dir,
        slot[next] < 0 ? "bash" : caps[slot[next]].out.name);
-  basht_display_set_owner (cand[next]);
+
+  /* show the destination's own pending input line, if it has one:
+     the relay buffer carrying half-typed text outranks the task's
+     bare partial */
+  {
+    const BASHT_STREAM *show = cand[next];
+    if (slot[next] < 0)
+      {
+	if (in_fg && ta_rly.lb.len > 0)
+	  show = &ta_rly;
+      }
+    else if (in_fg && caps[slot[next]].pid == fg_pid
+	     && fg_rly.lb.len > 0)
+      show = &fg_rly;
+    else if (rslot == slot[next] && prompt_rly.lb.len > 0)
+      show = &prompt_rly;
+    basht_display_set_owner (show);
+  }
   basht_display_sync ();
 }
 
