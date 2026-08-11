@@ -149,6 +149,21 @@ basht_display_event (const BASHT_STREAM *ts, const char *fmt, ...)
   basht_display_line (&ev, msg, strlen (msg));
 }
 
+/* Operator clear (the `clear' builtin): wipe the screen -- and the
+   scrollback, unless KEEP -- and home the cursor. The bottom line
+   redraws at the next sync. Tasks cannot reach this: escapes in
+   task output are filtered; clearing the shared console is the
+   operator's decision alone. */
+void
+basht_display_clear (int keep)
+{
+  if (keep == 0)
+    basht_write_all (term_fd, "\033[3J", 4);
+  basht_write_all (term_fd, "\033[H\033[2J", 7);
+  shown = 0;
+  dirty = 1;
+}
+
 /* A stream's partial line changed: it takes (or, now empty, gives
    up) bottom-line ownership. Drawing is deferred to sync so one
    drain pass redraws at most once. */

@@ -1223,6 +1223,24 @@ basht_send_input (const char *name, int inst, const char *text)
   return 0;
 }
 
+/* `clear' builtin: the operator clears the console. Only the
+   parent interactive shell may touch the real terminal; in a
+   forked child (subshell, background) or a non-interactive shell
+   this returns 0 and the builtin falls back to writing the ANSI
+   sequence to stdout -- which on a task pty is filtered out
+   (tasks may not clear the console), and on a plain terminal is
+   stock clear(1) behavior. KEEP nonzero preserves scrollback. */
+int
+basht_console_clear (int keep)
+{
+  if (basht_active == 0 || getpid () != self.pid)
+    return 0;
+  basht_drain ();
+  basht_display_clear (keep);
+  basht_display_sync ();
+  return 1;
+}
+
 /* ---- prompt-time relay: input follows the incomplete-line rule --
 
    While readline is reading the shell's command line, a captured

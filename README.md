@@ -62,6 +62,11 @@ task 0's unfinished line.
 - **`feed name[:n] text...`**: one line into a background task's stdin
   without foregrounding it. (The tsh design calls this `in`, which is a
   bash reserved word.)
+- **`clear` is a builtin**: clearing the shared console is the
+  operator's decision, so basht performs it directly (`-x` keeps the
+  scrollback). Tasks cannot clear the screen — escape sequences in task
+  output never reach the terminal, and that includes `clear` run in the
+  background.
 - **Full-screen programs get a window**: a task that enables the alternate
   screen (vim, less, htop) is detected at its first escape and moved into
   its own terminal window automatically — the console never stops

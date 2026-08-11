@@ -70,6 +70,7 @@ void basht_display_sync (void);
 void basht_display_set_default (const BASHT_STREAM *);
 const BASHT_STREAM *basht_display_owner (void);
 void basht_display_set_owner (const BASHT_STREAM *);
+void basht_display_clear (int keep);
 void basht_display_set_terminal (int);
 void basht_write_all (int, const void *, size_t);
 
@@ -93,6 +94,9 @@ void basht_fg_end (void);       /* fg wait over: restore terminal */
 int  basht_send_input (const char *, int, const char *);
                                 /* `feed' builtin: name, instance
                                    (<=0 = sole live match), text */
+int  basht_console_clear (int keep);
+                                /* `clear' builtin: 1 = cleared; 0 =
+                                   caller falls back to stdout */
 int  basht_bridge_main (const char *, const char *);
                                 /* --basht-bridge: run inside the
                                    spawned terminal window */
