@@ -71,6 +71,7 @@ void basht_display_set_default (const BASHT_STREAM *);
 const BASHT_STREAM *basht_display_owner (void);
 void basht_display_set_owner (const BASHT_STREAM *);
 void basht_display_clear (int keep);
+void basht_display_set_tagfmt (const char *);  /* PST1; 0 = default */
 void basht_display_set_terminal (int);
 void basht_write_all (int, const void *, size_t);
 

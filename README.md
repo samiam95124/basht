@@ -31,6 +31,19 @@ process id (kill it directly), and the task's own line counter. Marks after
 `n`: `!` stderr, `*` shell events. The shell is task 0 — its prompt is just
 task 0's unfinished line.
 
+The tag has its own prompt string, `PST1` — the preamble's parallel to
+`PS1`, and an ordinary shell variable read afresh for every line. Fields:
+`\n` program name, `\i` instance (the stream mark rides just after it),
+`\t` task process id, `\l` line number; anything else is literal. The
+default is equivalent to
+
+```
+PST1='[\n:\i:\t:\l]'
+```
+
+`PST1='<\n#\i>'` gives compact tags like `<hello#2>`; `PST1=''` turns
+tags off entirely; `unset PST1` restores the default.
+
 ## What works
 
 - **Attribution**: concurrent tasks cannot interleave mid-line, ever — the
