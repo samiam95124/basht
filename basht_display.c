@@ -59,6 +59,15 @@ basht_display_set_default (const BASHT_STREAM *ts)
   dirty = 1;
 }
 
+/* The bottom-line owner under the incomplete-line rule, or 0 when
+   no stream is mid-line. Input routing follows this: the owner's
+   task receives the keyboard. */
+const BASHT_STREAM *
+basht_display_owner (void)
+{
+  return bot;
+}
+
 /* Tag: [name:n:pid:line] with the stream mark, if any, after n.
    LINENO is the completed line's number, or the number the pending
    bottom line will get. */
