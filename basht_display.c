@@ -68,6 +68,17 @@ basht_display_owner (void)
   return bot;
 }
 
+/* Manual selection (task cycling): force the owner. 0 falls back
+   to the default stream at the next sync. */
+void
+basht_display_set_owner (const BASHT_STREAM *ts)
+{
+  if (bot == ts)
+    return;
+  bot = ts;
+  dirty = 1;
+}
+
 /* Tag: [name:n:pid:line] with the stream mark, if any, after n.
    LINENO is the completed line's number, or the number the pending
    bottom line will get. */
