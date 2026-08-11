@@ -43,8 +43,7 @@ struct basht_linebuf {
 typedef struct basht_stream {
   char name[BASHT_NAME_MAX];
   int  id;
-  char mark;                    /* 0 stdout, '!' stderr, '*' event,
-                                   '<' relayed input */
+  char mark;                    /* 0 stdout, '!' stderr, '*' event */
   pid_t pid;                    /* shown in the tag; kill-able */
   int  *lines;                  /* shared per-task line counter:
                                    ++ on each completed line */

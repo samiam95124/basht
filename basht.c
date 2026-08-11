@@ -686,7 +686,7 @@ basht_command_begin (void)
    waitpid. Keeps every pty draining while a foreground job runs,
    and relays the real keyboard to the job: the terminal goes raw
    (ISIG off), typed characters build the job's pending input line
-   (displayed as "[name:N<] text"), Enter ships it to the job's in
+   under the job's own tag, Enter ships it to the job's in
    pty, ^C/^Z become killpg(SIGINT/SIGTSTP) on the job's process
    group, ^D sends VEOF. Returns 1 if it pumped (caller should then
    reap with WNOHANG), 0 to fall back to a blocking wait. */
@@ -738,10 +738,13 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
 /* Raw keyboard bytes become relay input for CP: printables build
    RLY's pending line, displayed under the task's own tag (same
    width, so typing never shifts the line) as "[name:N] prompt
-   typed-text". Enter ships the typed part to the task's in pty and
-   the completed record scrolls up marked '<'; backspace edits,
-   ^C/^Z signal the task's process group, ^D forwards VEOF. Shared
-   by the foreground pump and the prompt-time relay. */
+   typed-text". Enter ships the typed part to the task's in pty;
+   the record that scrolls up is the task's line as a shared
+   terminal would have shown it -- prompt plus echoed input, ended
+   by Enter's echo -- so the task's pending line is completed by it
+   and the task's next output starts fresh. Backspace edits, ^C/^Z
+   signal the task's process group, ^D forwards VEOF. Shared by the
+   foreground pump and the prompt-time relay. */
 static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	     const char *buf, ssize_t n)
@@ -762,9 +765,7 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
       else if (c == '\r' || c == '\n')
 	{
 	  relay_prefix (cp, rly);
-	  rly->mark = '<';	/* the record notes keyboard origin */
 	  basht_display_line (rly, rly->lb.data, rly->lb.len);
-	  rly->mark = 0;
 	  if (cp->m_in >= 0)
 	    {
 	      rly->lb.data[rly->lb.len] = '\n';
@@ -773,6 +774,19 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	    }
 	  rly->lb.len = rly->lb.cur = rly->lb.fix = 0;
 	  basht_display_partial (rly);
+	  /* Enter's echo ends the task's pending line on a shared
+	     terminal, and the record just displayed IS that line:
+	     complete it, so the task's next output starts fresh */
+	  if (cp->out.lb.len > 0)
+	    {
+	      cp->out.lb.len = cp->out.lb.cur = 0;
+	      basht_display_partial (&cp->out);
+	    }
+	  else if (cp->err.lb.len > 0)
+	    {
+	      cp->err.lb.len = cp->err.lb.cur = 0;
+	      basht_display_partial (&cp->err);
+	    }
 	}
       else if (c == 0x7f || c == '\b')
 	{
@@ -792,16 +806,6 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	  basht_display_partial (rly);
 	}
       /* other control characters are dropped */
-
-      /* relay line empty again: the task's own partial (the prompt
-	 that earned it the console) returns to the bottom line */
-      if (rly->lb.len == 0)
-	{
-	  if (cp->out.lb.len > 0)
-	    basht_display_partial (&cp->out);
-	  else if (cp->err.lb.len > 0)
-	    basht_display_partial (&cp->err);
-	}
     }
 }
 
