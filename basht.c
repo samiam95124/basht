@@ -710,11 +710,36 @@ fg_signal (pid_t pid, int sig)
     kill (pid, sig);
 }
 
+/* Starting a relay line: seed it with the task's own partial (the
+   prompt), so the input line reads "enter a line: typed text" just
+   as echo on a shared terminal would. The prefix is display-only:
+   never shipped, never backspaced over. */
+static void
+relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
+{
+  const struct basht_linebuf *src = 0;
+  size_t n;
+
+  if (rly->lb.len > 0 || rly->lb.fix > 0)
+    return;			/* line already started */
+  if (cp->out.lb.len > 0)
+    src = &cp->out.lb;
+  else if (cp->err.lb.len > 0)
+    src = &cp->err.lb;
+  if (src == 0)
+    return;
+  n = src->len;
+  if (n > BASHT_LINEBUF_CAP / 2)	/* keep room for typing */
+    n = BASHT_LINEBUF_CAP / 2;
+  memcpy (rly->lb.data, src->data, n);
+  rly->lb.len = rly->lb.cur = rly->lb.fix = n;
+}
+
 /* Raw keyboard bytes become relay input for CP: printables build
-   RLY's pending line (displayed "[name:N<] text"), Enter ships it
-   to the task's in pty, backspace edits, ^C/^Z signal the task's
-   process group, ^D forwards VEOF. Shared by the foreground pump
-   and the prompt-time relay. */
+   RLY's pending line (displayed "[name:N<] prompt typed-text"),
+   Enter ships the typed part to the task's in pty, backspace edits,
+   ^C/^Z signal the task's process group, ^D forwards VEOF. Shared
+   by the foreground pump and the prompt-time relay. */
 static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	     const char *buf, ssize_t n)
@@ -734,25 +759,27 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	}
       else if (c == '\r' || c == '\n')
 	{
+	  relay_prefix (cp, rly);
 	  basht_display_line (rly, rly->lb.data, rly->lb.len);
 	  if (cp->m_in >= 0)
 	    {
 	      rly->lb.data[rly->lb.len] = '\n';
-	      basht_write_all (cp->m_in, rly->lb.data,
-			       rly->lb.len + 1);
+	      basht_write_all (cp->m_in, rly->lb.data + rly->lb.fix,
+			       rly->lb.len - rly->lb.fix + 1);
 	    }
-	  rly->lb.len = rly->lb.cur = 0;
+	  rly->lb.len = rly->lb.cur = rly->lb.fix = 0;
 	  basht_display_partial (rly);
 	}
       else if (c == 0x7f || c == '\b')
 	{
-	  if (rly->lb.len > 0)
+	  if (rly->lb.len > rly->lb.fix)
 	    rly->lb.cur = --rly->lb.len;
 	  basht_display_partial (rly);
 	}
       else if (c == '\t' || c >= 0x20)
 	{
 	  dbg ("relay %s", dbgch (c));
+	  relay_prefix (cp, rly);
 	  if (rly->lb.len < BASHT_LINEBUF_CAP - 2)
 	    {
 	      rly->lb.data[rly->lb.len++] = (char)c;
@@ -903,12 +930,14 @@ basht_fg_end (void)
       fg_raw = 0;
     }
   fg_pid = -1;
-  if (fg_rly.lb.len > 0)
-    dbg ("fg_end stuff-back %d chars '%.*s'", (int)fg_rly.lb.len,
-	 (int)fg_rly.lb.len, fg_rly.lb.data);
-  for (i = 0; i < fg_rly.lb.len; i++)
+  if (fg_rly.lb.len > fg_rly.lb.fix)
+    dbg ("fg_end stuff-back %d chars '%.*s'",
+	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
+	 (int)(fg_rly.lb.len - fg_rly.lb.fix),
+	 fg_rly.lb.data + fg_rly.lb.fix);
+  for (i = fg_rly.lb.fix; i < fg_rly.lb.len; i++)
     rl_stuff_char ((unsigned char)fg_rly.lb.data[i]);
-  fg_rly.lb.len = fg_rly.lb.cur = 0;
+  fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
   basht_display_stream_gone (&fg_rly);
   basht_drain ();
 }
@@ -996,16 +1025,17 @@ prompt_relay_drop (void)
 {
   int c = -1;
 
-  if (prompt_rly.lb.len > 0)
+  if (prompt_rly.lb.len > prompt_rly.lb.fix)
     {
+      size_t fix = prompt_rly.lb.fix;
       dbg ("prompt relay stuff-back %d chars '%.*s'",
-	   (int)prompt_rly.lb.len, (int)prompt_rly.lb.len,
-	   prompt_rly.lb.data);
-      c = (unsigned char)prompt_rly.lb.data[0];
-      for (size_t i = 1; i < prompt_rly.lb.len; i++)
+	   (int)(prompt_rly.lb.len - fix),
+	   (int)(prompt_rly.lb.len - fix), prompt_rly.lb.data + fix);
+      c = (unsigned char)prompt_rly.lb.data[fix];
+      for (size_t i = fix + 1; i < prompt_rly.lb.len; i++)
 	rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
-      prompt_rly.lb.len = prompt_rly.lb.cur = 0;
     }
+  prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
   basht_display_stream_gone (&prompt_rly);
   rslot = -1;
   return c;
@@ -1018,9 +1048,8 @@ prompt_relay_bind (struct basht_cap *cp)
 {
   if (rslot == (int)(cp - caps) && prompt_rly.pid == cp->pid)
     return;
-  if (prompt_rly.lb.len > 0)
-    for (size_t i = 0; i < prompt_rly.lb.len; i++)
-      rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
+  for (size_t i = prompt_rly.lb.fix; i < prompt_rly.lb.len; i++)
+    rl_stuff_char ((unsigned char)prompt_rly.lb.data[i]);
   memset (&prompt_rly, 0, sizeof prompt_rly);
   strcpy (prompt_rly.name, cp->out.name);
   prompt_rly.id = cp->out.id;

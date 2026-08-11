@@ -30,6 +30,10 @@ struct basht_linebuf {
   char   data[BASHT_LINEBUF_CAP];
   size_t len;                   /* logical line length            */
   size_t cur;                   /* cursor position, always <= len */
+  size_t fix;                   /* immutable prefix: relay lines
+                                   carry the task's echoed prompt
+                                   here; never shipped or edited.
+                                   Always 0 for filtered streams. */
   enum basht_filt_state fs;
   int    csi_n;                 /* first CSI numeric parameter    */
   int    csi_more;              /* saw ';' -- later params ignored */
