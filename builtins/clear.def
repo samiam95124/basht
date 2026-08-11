@@ -1,0 +1,90 @@
+This file is clear.def, from which is created clear.c.
+It implements the builtin "clear" in Bash.
+
+Copyright (C) 2026 Free Software Foundation, Inc.
+
+This file is part of GNU Bash, the Bourne Again SHell.
+
+Bash is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Bash is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+
+$PRODUCES clear.c
+
+$BUILTIN clear
+$FUNCTION clear_builtin
+$SHORT_DOC clear [-x]
+Clear the console.
+
+The operator's clear: wipes the screen and, without -x, the
+scrollback, then redraws the console bottom line. Tasks cannot do
+this themselves -- escape sequences in task output never reach the
+terminal; clearing the shared console is the operator's decision
+alone.
+
+When the multiplexer is not in charge (non-interactive shells,
+subshells, background invocations) the ANSI clear sequence is
+written to standard output instead: on a plain terminal that is
+stock clear(1) behavior, and on a task pty the filter removes it.
+
+Options:
+  -x	do not clear the scrollback buffer
+
+Exit Status:
+Always succeeds unless an invalid option is given.
+$END
+
+#include <config.h>
+
+#if defined (HAVE_UNISTD_H)
+#  include <unistd.h>
+#endif
+
+#include <stdio.h>
+
+#include "../bashintl.h"
+#include "../shell.h"
+#include "common.h"
+#include "bashgetopt.h"
+
+extern int basht_console_clear (int);
+
+int
+clear_builtin (WORD_LIST *list)
+{
+  int opt, keep_scrollback;
+
+  keep_scrollback = 0;
+  reset_internal_getopt ();
+  while ((opt = internal_getopt (list, "x")) != -1)
+    {
+      switch (opt)
+	{
+	case 'x':
+	  keep_scrollback = 1;
+	  break;
+	CASE_HELPOPT;
+	default:
+	  builtin_usage ();
+	  return (EX_USAGE);
+	}
+    }
+
+  if (basht_console_clear (keep_scrollback))
+    return (EXECUTION_SUCCESS);
+
+  if (keep_scrollback == 0)
+    printf ("\033[3J");
+  printf ("\033[H\033[2J");
+  fflush (stdout);
+  return (EXECUTION_SUCCESS);
+}
