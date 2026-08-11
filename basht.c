@@ -356,6 +356,7 @@ drain_cap_fd (int *fd, BASHT_STREAM *ts)
 }
 
 static void fg_signal (pid_t, int);
+static void basht_cycle_owner (int);
 
 /* ---- auto-window: full-screen tasks move to a terminal window ---
 
@@ -743,15 +744,55 @@ relay_prefix (struct basht_cap *cp, BASHT_STREAM *rly)
    terminal would have shown it -- prompt plus echoed input, ended
    by Enter's echo -- so the task's pending line is completed by it
    and the task's next output starts fresh. Backspace edits, ^C/^Z
-   signal the task's process group, ^D forwards VEOF. Shared by the
+   signal the task's process group, ^D forwards VEOF. Escape
+   sequences are swallowed, never typed into the line; when CYCLES
+   is set (prompt-time relay) alt-left/right (CSI 1;3 D/C) cycle
+   the console between the inputting tasks. Shared by the
    foreground pump and the prompt-time relay. */
 static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
-	     const char *buf, ssize_t n)
+	     const char *buf, ssize_t n, int cycles)
 {
   for (ssize_t k = 0; k < n; k++)
     {
       unsigned char c = (unsigned char)buf[k];
+      if (rly->lb.fs == BF_ESC)
+	{
+	  if (c == '[')
+	    {
+	      rly->lb.fs = BF_CSI;
+	      rly->lb.csi_n = rly->lb.csi_n2 = 0;
+	      rly->lb.csi_more = 0;
+	    }
+	  else
+	    rly->lb.fs = BF_NORMAL;	/* ESC x: swallow both */
+	  continue;
+	}
+      if (rly->lb.fs == BF_CSI)
+	{
+	  if (c >= '0' && c <= '9')
+	    {
+	      if (rly->lb.csi_more)
+		rly->lb.csi_n2 = rly->lb.csi_n2 * 10 + (c - '0');
+	      else
+		rly->lb.csi_n = rly->lb.csi_n * 10 + (c - '0');
+	    }
+	  else if (c == ';')
+	    rly->lb.csi_more = 1;
+	  else if (c >= 0x40 && c <= 0x7e)
+	    {
+	      rly->lb.fs = BF_NORMAL;
+	      if (cycles && rly->lb.csi_n == 1 && rly->lb.csi_n2 == 3
+		  && (c == 'C' || c == 'D'))
+		basht_cycle_owner (c == 'C' ? 1 : -1);
+	    }
+	  continue;
+	}
+      if (c == 0x1b)
+	{
+	  rly->lb.fs = BF_ESC;
+	  continue;
+	}
       if (c == 0x03)		/* ^C */
 	fg_signal (cp->pid, SIGINT);
       else if (c == 0x1a)		/* ^Z */
@@ -912,7 +953,7 @@ basht_fg_pump (pid_t pid)
 	  fg_stdin_open = 0;
 	}
       else
-	relay_chars (cp, &fg_rly, buf, n);
+	relay_chars (cp, &fg_rly, buf, n, 0);
     }
 
   basht_drain ();
@@ -1067,6 +1108,80 @@ prompt_relay_bind (struct basht_cap *cp)
        prompt_rly.id, (int)prompt_rly.pid);
 }
 
+/* Alt-Left/Right: cycle the console between the inputting tasks --
+   every stream currently mid-line, the shell's own prompt included
+   (the shell is always inputting while readline reads). Selection
+   is a forced instance of the ownership rule; the next task to
+   write on an incomplete line steals the console back as usual. */
+static void
+basht_cycle_owner (int dir)
+{
+  const BASHT_STREAM *own = basht_display_owner ();
+  const BASHT_STREAM *cand[BASHT_MAX_CAPS + 1];
+  int slot[BASHT_MAX_CAPS + 1];
+  int n = 0, cur = -1, next, i;
+
+  /* the shell first: bot == 0 means input already goes to
+     readline, so it counts as the shell's position */
+  cand[n] = self.lb.len > 0 ? &self : 0;
+  slot[n] = -1;
+  if (own == 0 || own == &self)
+    cur = n;
+  n++;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    {
+      struct basht_cap *cp = &caps[i];
+      if (cp->out.id == 0 || cp->m_in < 0 || cp->windowed || cp->w_was)
+	continue;
+      if (cp->out.lb.len == 0 && cp->err.lb.len == 0)
+	continue;
+      cand[n] = cp->out.lb.len > 0 ? &cp->out : &cp->err;
+      slot[n] = i;
+      if (own == &cp->out || own == &cp->err
+	  || (own == &prompt_rly && rslot == i))
+	cur = n;
+      n++;
+    }
+
+  if (n < 2)
+    return;			/* nothing to switch to */
+  next = cur < 0 ? (dir > 0 ? 0 : n - 1) : (cur + dir + n) % n;
+  if (next == cur)
+    return;
+
+  /* half-typed input for the task being left becomes type-ahead */
+  if (rslot >= 0 && rslot != slot[next])
+    {
+      for (size_t k = prompt_rly.lb.fix; k < prompt_rly.lb.len; k++)
+	rl_stuff_char ((unsigned char)prompt_rly.lb.data[k]);
+      prompt_rly.lb.len = prompt_rly.lb.cur = prompt_rly.lb.fix = 0;
+      basht_display_stream_gone (&prompt_rly);
+      rslot = -1;
+    }
+
+  dbg ("cycle owner %+d -> %s", dir,
+       slot[next] < 0 ? "bash" : caps[slot[next]].out.name);
+  basht_display_set_owner (cand[next]);
+  basht_display_sync ();
+}
+
+/* the readline ends of the same keys, for when the shell owns the
+   console and the sequence arrives through rl_getc */
+static int
+rl_basht_cycle_right (int count, int key)
+{
+  basht_cycle_owner (1);
+  return 0;
+}
+
+static int
+rl_basht_cycle_left (int count, int key)
+{
+  basht_cycle_owner (-1);
+  return 0;
+}
+
 /* readline's character source. Instead of rl_event_hook (whose
    wait loop spins forever on non-tty EOF), we select over stdin and
    the task-0 master: output drains the moment it lands in the pty,
@@ -1145,7 +1260,7 @@ basht_getc (FILE *stream)
 	      if (n > 0)
 		{
 		  prompt_relay_bind (cp);
-		  relay_chars (cp, &prompt_rly, buf, n);
+		  relay_chars (cp, &prompt_rly, buf, n, 1);
 		  basht_display_sync ();
 		  continue;
 		}
@@ -1237,6 +1352,8 @@ basht_init (void)
   }
 
   rl_getc_function = basht_getc;
+  rl_bind_keyseq ("\033[1;3C", rl_basht_cycle_right);	/* alt-right */
+  rl_bind_keyseq ("\033[1;3D", rl_basht_cycle_left);	/* alt-left  */
 
   {
     const char *p = getenv ("BASHT_DEBUG");

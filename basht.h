@@ -36,7 +36,9 @@ struct basht_linebuf {
                                    Always 0 for filtered streams. */
   enum basht_filt_state fs;
   int    csi_n;                 /* first CSI numeric parameter    */
-  int    csi_more;              /* saw ';' -- later params ignored */
+  int    csi_more;              /* saw ';': filter ignores later
+                                   params, the relay collects one */
+  int    csi_n2;                /* second parameter (relay keys)   */
   int    csi_priv;              /* saw '?' (DEC private mode)     */
 };
 
@@ -67,6 +69,7 @@ void basht_display_stream_gone (const BASHT_STREAM *);
 void basht_display_sync (void);
 void basht_display_set_default (const BASHT_STREAM *);
 const BASHT_STREAM *basht_display_owner (void);
+void basht_display_set_owner (const BASHT_STREAM *);
 void basht_display_set_terminal (int);
 void basht_write_all (int, const void *, size_t);
 

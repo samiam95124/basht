@@ -28,8 +28,8 @@ you are typing survives untouched at the bottom of the screen.
 Every line is prefixed `[name:n:pid:line]`: the command's name, which
 instance of that name this session (`hello:2` is the second hello), the
 process id (kill it directly), and the task's own line counter. Marks after
-`n`: `!` stderr, `*` shell events, `<` input relayed to the task. The shell
-is task 0 — its prompt is just task 0's unfinished line.
+`n`: `!` stderr, `*` shell events. The shell is task 0 — its prompt is just
+task 0's unfinished line.
 
 ## What works
 
@@ -37,10 +37,20 @@ is task 0 — its prompt is just task 0's unfinished line.
   kernel sorts their bytes by pty before the shell touches them.
 - **Print-through**: background output scrolls above a stable prompt; the
   entry line is erased, the line printed, your typing redrawn beneath.
+- **Input follows the console**: a task that prompts — writes a line it
+  doesn't finish — owns the console and receives the keyboard, foreground
+  or background. Typing continues its line exactly as echo on a shared
+  terminal; Enter ships the typed part to its stdin and completes the
+  line. When it finishes its line, the console reverts to the shell and
+  any half-typed input becomes type-ahead at the prompt.
+- **Alt-Left/Right cycles the inputting tasks**: every task currently
+  mid-line, the shell's own prompt included, in a ring. Selection is just
+  a forced instance of the ownership rule — the next task to prompt takes
+  the console back.
 - **Serial foreground**: a command run without `&` takes the console like
-  stock bash; typing relays to its stdin (shown as `[name:n<]`), `^C`/`^Z`
-  are delivered by process group, and background tasks keep printing
-  through the whole time.
+  stock bash; typing relays to its stdin, `^C`/`^Z` are delivered by
+  process group, and background tasks keep printing through the whole
+  time.
 - **`feed name[:n] text...`**: one line into a background task's stdin
   without foregrounding it. (The tsh design calls this `in`, which is a
   bash reserved word.)
