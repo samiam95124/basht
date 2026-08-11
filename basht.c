@@ -696,6 +696,10 @@ basht_drain (void)
 {
   if (basht_active == 0)
     return;
+  /* PST1 -- the tag template -- is an ordinary shell variable,
+     re-read like the prompt strings are: a change shows on the
+     next line displayed */
+  basht_display_set_tagfmt (get_string_value ("PST1"));
   fflush (stdout);
   fflush (stderr);
   drain_self ();

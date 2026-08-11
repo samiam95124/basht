@@ -79,17 +79,71 @@ basht_display_set_owner (const BASHT_STREAM *ts)
   dirty = 1;
 }
 
-/* Tag: [name:n:pid:line] with the stream mark, if any, after n.
-   LINENO is the completed line's number, or the number the pending
-   bottom line will get. */
+/* PST1: the tag template, the preamble's own prompt string. 0
+   means the built-in default. Fields: \n program name, \i instance
+   (the stream mark -- '!' stderr, '*' event -- rides just after
+   it), \t task process id, \l line number; \\ a backslash; other
+   escapes pass through literally. The rendered tag is followed by
+   one separating space; an empty template renders untagged lines. */
+static const char *tagfmt;
+
+void
+basht_display_set_tagfmt (const char *fmt)
+{
+  tagfmt = fmt;
+}
+
+/* Render the tag for TS. LINENO is the completed line's number, or
+   the number the pending bottom line will get. */
 static int
 make_tag (char *out, size_t cap, const BASHT_STREAM *ts, int lineno)
 {
-  if (ts->mark)
-    return snprintf (out, cap, "[%s:%d%c:%ld:%d] ", ts->name, ts->id,
-		     ts->mark, (long)ts->pid, lineno);
-  return snprintf (out, cap, "[%s:%d:%ld:%d] ", ts->name, ts->id,
-		   (long)ts->pid, lineno);
+  const char *f = tagfmt ? tagfmt : "[\\n:\\i:\\t:\\l]";
+  size_t o = 0;
+  int w;
+
+  while (*f && o + 2 < cap)
+    {
+      if (*f != '\\' || f[1] == '\0')
+	{
+	  out[o++] = *f++;
+	  continue;
+	}
+      f++;			/* at the escape letter */
+      w = 0;
+      switch (*f)
+	{
+	case 'n':
+	  w = snprintf (out + o, cap - o - 2, "%s", ts->name);
+	  break;
+	case 'i':
+	  if (ts->mark)
+	    w = snprintf (out + o, cap - o - 2, "%d%c", ts->id, ts->mark);
+	  else
+	    w = snprintf (out + o, cap - o - 2, "%d", ts->id);
+	  break;
+	case 't':
+	  w = snprintf (out + o, cap - o - 2, "%ld", (long)ts->pid);
+	  break;
+	case 'l':
+	  w = snprintf (out + o, cap - o - 2, "%d", lineno);
+	  break;
+	case '\\':
+	  out[o++] = '\\';
+	  break;
+	default:		/* unknown escape: literal */
+	  out[o++] = '\\';
+	  out[o++] = *f;
+	  break;
+	}
+      if (w > 0)
+	o += (size_t)w <= cap - o - 2 ? (size_t)w : cap - o - 2;
+      f++;
+    }
+  if (o > 0)
+    out[o++] = ' ';		/* empty template: untagged lines */
+  out[o] = '\0';
+  return (int)o;
 }
 
 /* CR, as many spaces as are drawn, CR. */
