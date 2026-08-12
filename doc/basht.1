@@ -214,8 +214,23 @@ task, split on blanks. Default:
 A file name; when set, basht appends a trace of everything touching
 the input path, for debugging keystroke routing.
 .SH NOTES
-Nested interactive shells run without job control: a console task's
-pseudoterminal is not a controlling terminal, so
+A sole command (not part of a pipeline) runs in its own session
+with its input pty as controlling terminal, so
+.B /dev/tty
+resolves to the task's own pty: pagers
+.RB ( man ,
+.BR less ),
+password prompts
+.RB ( ssh ,
+.BR sudo )
+and
+.BR getpass (3)
+work on the console. Pipeline stages share the job's process group
+and have no controlling terminal.
+.PP
+Nested interactive shells still run without job control: bash
+locates its job-control terminal through standard error, which is
+a separate capture pty, so
 .BR fg ,
 .BR bg ,
 and

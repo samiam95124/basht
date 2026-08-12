@@ -2409,8 +2409,15 @@ make_child (char *command, int flags)
 	     this would have for the first child) is an error.  Section
 	     B.4.3.3, p. 237 also covers this, in the context of job control
 	     shells. */
-	  if ((flags & FORK_NOJOB) == 0 && setpgid (mypid, pipeline_pgrp) < 0)
-	    sys_error (_("child setpgid (%ld to %ld)"), (long)mypid, (long)pipeline_pgrp);
+	  /* basht: a child that made itself a session leader owning
+	     its capture pty already has the right pgid, and setpgid
+	     on a session leader is EPERM -- skip it. */
+	  {
+	    extern int basht_child_sess;
+	    if ((flags & FORK_NOJOB) == 0 && basht_child_sess == 0
+		&& setpgid (mypid, pipeline_pgrp) < 0)
+	      sys_error (_("child setpgid (%ld to %ld)"), (long)mypid, (long)pipeline_pgrp);
+	  }
 
 	  /* By convention (and assumption above), if
 	     pipeline_pgrp == shell_pgrp, we are making a child for
@@ -2473,8 +2480,15 @@ make_child (char *command, int flags)
 	     the POSIX 1003.1 standard, where it discusses job control and
 	     shells.  It is done to avoid possible race conditions. (Ref.
 	     1003.1 Rationale, section B.4.3.3, page 236). */
+	  /* basht: not for a child taking its own session -- winning
+	     this race would make it a process-group leader, and a
+	     group leader can never setsid. */
 	  if ((flags & FORK_NOJOB) == 0)
-	    setpgid (pid, pipeline_pgrp);
+	    {
+	      extern int basht_sess_child (pid_t);
+	      if (basht_sess_child (pid) == 0)
+		setpgid (pid, pipeline_pgrp);
+	    }
 	}
       else
 	{

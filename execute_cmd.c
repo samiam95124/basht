@@ -5831,6 +5831,12 @@ execute_disk_command (WORD_LIST *words, REDIRECT *redirects, char *command_line,
   else
     {
       fork_flags = async ? FORK_ASYNC : 0;
+      /* basht: a sole command (no pipeline) may become a session
+	 leader owning its capture pty as controlling terminal */
+      {
+	extern int basht_fork_solo;
+	basht_fork_solo = (pipe_in == NO_PIPE && pipe_out == NO_PIPE);
+      }
       pid = make_child (p = savestring (command_line), fork_flags);
     }
 
