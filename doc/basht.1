@@ -1,0 +1,242 @@
+.\" basht.1 -- the basht additions to bash. Everything inherited is
+.\" documented in bash(1); this page covers only what basht adds.
+.\"
+.\" basht is a modification of GNU bash and is distributed under the
+.\" same terms, GPLv3.
+.\"
+.TH BASHT 1 "2026 August 11" "basht v0.3" "General Commands Manual"
+.SH NAME
+basht \- bash adapted to a line-multiplexed tagged display
+.SH SYNOPSIS
+.B basht
+[options]
+[command_string | file]
+.SH COPYRIGHT
+basht is a modification of GNU
+.BR bash ,
+distributed under the same terms, the GNU General Public License
+version 3. This page documents only the basht additions; for the
+shell itself \(em options, grammar, expansion, builtins, readline,
+job control \(em see
+.BR bash (1),
+which describes basht's behavior exactly.
+.SH DESCRIPTION
+.B basht
+is bash with a multiplexed console. No task ever writes to the
+terminal: every task \(em the shell included \(em writes to its own
+pseudoterminals, and output reaches the screen as whole lines, each
+prefixed with a tag naming who wrote it. Concurrent tasks cannot
+interleave mid-line; background output scrolls above the line being
+typed, which survives untouched at the bottom of the screen.
+.PP
+The shell itself is task 0. Its prompt is nothing special: just
+task 0's unfinished line, governed by the same rules as every other
+task's.
+.PP
+An interactive shell brings up the multiplexer. Non-interactive
+shells \(em
+.B basht \-c
+commands, scripts,
+.B #!
+interpreters, cron jobs \(em are untouched and behave exactly like
+stock bash.
+.SH THE TAG
+Every displayed line is prefixed
+.BR [name:n:pid:line] :
+the command's name, which instance of that name this session
+(\fBhello:2\fP is the second hello started), the process id (which
+can be killed directly), and the task's own line counter. A mark
+may follow the instance number:
+.B !
+for stderr,
+.B *
+for shell events (a task moved to a window, a window closed).
+.PP
+The tag format is set by the shell variable
+.SM
+.BR PST1 ,
+the preamble's parallel to
+.SM
+.BR PS1 ;
+see
+.SM
+.B "SHELL VARIABLES"
+below.
+.SH THE CONSOLE AND INPUT
+The bottom line of the screen is the console. It is owned by
+whichever task last wrote a character on an incomplete line \(em a
+line not yet ended with a newline. A task that completes its lines
+has them printed above the console; a task with an incomplete line
+\fIis\fP the console, and receives the keyboard for as long as it
+owns it. A task that prompts \(em foreground or background \(em
+takes the console the moment the prompt appears, and gives it back
+when its line completes. The shell's prompt obeys the same rule.
+.PP
+How keystrokes are delivered follows the owning task's own line
+discipline, read from the termios of its stdin:
+.TP
+.B canonical
+(ICANON set: programs using
+.BR read (2)
+on a cooked terminal,
+.BR fgets (3),
+the
+.B read
+builtin). Typing continues the task's visible line exactly as echo
+on a shared terminal would; backspace edits; Enter ships the typed
+text to the task's stdin and completes the displayed line, so the
+task's next output starts a fresh line. If the owning task exits or
+completes its line with input still pending, the typed text becomes
+editable type-ahead on the shell's command line.
+.TP
+.B raw
+(ICANON clear: readline programs \(em nested shells,
+.BR ssh (1),
+.BR sudo (8)
+.BR \-i ,
+REPLs such as python and gdb). Keystrokes pass straight through,
+escape sequences included, so the task's own editing, history and
+completion work natively; its echo paints the input line. While the
+task's terminal keeps ISIG,
+.B ^C
+and
+.B ^Z
+are delivered to its process group as the tty driver would;
+with ISIG off they are forwarded as bytes.
+.PP
+A command run in the foreground holds the keyboard like stock bash,
+whether or not it prompts, and background tasks keep printing
+through the whole time.
+.SH TASK CYCLING
+.B Alt\-Left
+and
+.B Alt\-Right
+cycle the console through the inputting tasks: every task currently
+mid-line, plus the shell, in a ring \(em at the prompt and during a
+foreground command alike (the foreground task is always in the
+ring). Selection is a forced instance of the ownership rule: at the
+prompt, the next task to write on an incomplete line takes the
+console back; during a foreground command the selection holds until
+the selected task goes away.
+.PP
+A task cycled away from keeps its half-typed input line and shows
+it again when reselected. Selecting the shell during a foreground
+command turns typing into a visible type-ahead line for the next
+prompt:
+.B Up
+and
+.B Down
+browse the shell history on it, and Enter queues the line to run
+when the prompt returns.
+.SH FULL-SCREEN PROGRAMS
+A task that enables the terminal's alternate screen (vim, less,
+htop) is detected at its first escape sequence and moved into its
+own terminal window; the console never stops multiplexing. The
+window tracks resizes, and closing it hangs up the task. The
+command used to open the window is taken from
+.SM
+.B BASHT_TERMINAL
+(default
+.BR "gnome\-terminal \-\-" ).
+.PP
+Escape sequences never reach the real terminal from a task on the
+console: they are interpreted against the task's own line and
+otherwise discarded.
+.SH BUILTINS
+basht adds two builtins to those described in
+.BR bash (1):
+.TP
+\fBfeed\fP \fIname\fP[:\fIn\fP] \fItext\fP ...
+Write \fItext\fP (the remaining arguments joined by single spaces),
+followed by a newline, to the standard input of the named task,
+without foregrounding it. Tasks are addressed by their display tag;
+the :\fIn\fP instance may be omitted when exactly one task with
+that name is alive. Returns success unless the spec names no live
+task, or more than one and :\fIn\fP was omitted.
+.TP
+\fBclear\fP [\fB\-x\fP]
+The operator's clear: wipes the screen \(em and the scrollback,
+unless
+.B \-x
+\(em and redraws the console. Tasks cannot clear the screen
+themselves; that includes
+.B clear
+run in the background, whose escape sequences are filtered like any
+task output. In non-interactive shells and subshells the builtin
+writes the ANSI clear sequence to standard output, which is stock
+.BR clear (1)
+behavior.
+.SH SHELL VARIABLES
+.TP
+.B PST1
+The tag template, re-read for every line displayed. Fields:
+.B \en
+the program name,
+.B \ei
+the instance number (the stream mark rides just after it),
+.B \et
+the task process id,
+.B \el
+the line number;
+.B \e\e
+a backslash; anything else is literal. Unset, the format is
+equivalent to
+.PP
+.RS
+.nf
+PST1='[\en:\ei:\et:\el]'
+.fi
+.RE
+.IP
+which renders the standard tag. A nonempty tag is followed by one
+separating space; an empty
+.SM
+.B PST1
+renders untagged lines.
+.TP
+.B BASHT_LEVEL
+Incremented and exported at multiplexer startup, like
+.SM
+.BR SHLVL .
+A basht started beneath another basht's console (where its terminal
+is not a controlling tty it can own) sees it and runs plain, as a
+well-behaved raw-mode task of the outer shell, rather than
+double-multiplexing. A basht in its own terminal window multiplexes
+normally.
+.SH ENVIRONMENT
+.TP
+.B BASHT_TERMINAL
+The command prefix used to open a terminal window for a full-screen
+task, split on blanks. Default:
+.BR "gnome\-terminal \-\-" .
+.TP
+.B BASHT_DEBUG
+A file name; when set, basht appends a trace of everything touching
+the input path, for debugging keystroke routing.
+.SH NOTES
+Nested interactive shells run without job control: a console task's
+pseudoterminal is not a controlling terminal, so
+.BR fg ,
+.BR bg ,
+and
+.B ^Z
+inside a nested shell do not function, and bash prints its standard
+warning at startup. A shell that needs job control belongs in its
+own window.
+.PP
+Task instance numbers are basht's own and never reset during a
+session; they are not bash's
+.B %n
+job numbers.
+.SH SEE ALSO
+.BR bash (1),
+.BR pty (7),
+.BR stty (1)
+.PP
+The theory of operation
+.RB ( basht.theops ),
+the design specification
+.RB ( tsh_spec.md ),
+and the adaptation notes
+.RB ( basht_plan.md )
+in the source distribution.

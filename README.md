@@ -111,6 +111,8 @@ Non-interactive shells and scripts are untouched: `bash -c`, cron jobs and
 
 ## Reading
 
+- [`doc/basht.1`](doc/basht.1) — the man page for the basht additions
+  (`man basht` after install; everything inherited is in `man bash`)
 - [`basht.theops`](basht.theops) — theory of operation (start here)
 - [`tsh_spec.md`](tsh_spec.md) — the original design specification
 - [`basht_plan.md`](basht_plan.md) — the analysis of adapting bash
