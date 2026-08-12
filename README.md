@@ -61,9 +61,11 @@ tags off entirely; `unset PST1` restores the default.
   get the edited line relay above; a task that goes raw — nested shells,
   `ssh`, `sudo -i`, every readline REPL (`python`, `gdb`, `psql`) — gets
   keystrokes passed straight through, so its own editing, history, and
-  completion work natively, painted by its own echo. A nested basht
-  detects the outer one (`$BASHT_LEVEL`) and runs plain rather than
-  double-multiplexing.
+  completion work natively, painted by its own echo. A sole command owns
+  its pty as controlling terminal, so `/dev/tty` resolves to it — pagers
+  (`man`, `less`) and password prompts (`ssh`, `sudo`) work on the
+  console. A nested basht detects the outer one and runs plain rather
+  than double-multiplexing.
 - **Alt-Left/Right cycles the inputting tasks**: every task currently
   mid-line, the shell included, in a ring — at the prompt and during a
   foreground command alike (the foreground task is always in the ring).
@@ -129,8 +131,9 @@ Line-oriented commands are the point; full-screen programs belong in their
 windows. Pipeline stdin relay
 goes to the last stage; task ids are basht's own, not bash's `%n` job
 numbers; very long entry lines wrap and erase imperfectly. Nested shells
-run without job control (a capture pty is not a controlling terminal) —
-a shell that needs it belongs in a window.
+run without job control (bash locates its job-control tty through stderr,
+which is a separate capture pty) — a shell that needs it belongs in a
+window.
 
 ## License
 

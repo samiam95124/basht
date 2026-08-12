@@ -43,6 +43,15 @@
 int basht_active = 0;
 int basht_tty = -1;
 
+/* set by execute_cmd.c just before make_child: the next fork is a
+   sole command, eligible for a session of its own (issue #15) */
+int basht_fork_solo = 0;
+
+/* set in the child when it became a session leader owning its
+   capture pty; jobs.c skips its setpgid then (EPERM for a leader,
+   and the pgid is already right) */
+int basht_child_sess = 0;
+
 /* BASHT_DEBUG=<file>: append a trace of everything that touches the
    input path -- for hunting rare lost-keystroke reports. */
 static FILE *dbglog;
@@ -105,6 +114,9 @@ struct basht_cap {
   size_t nbytes;		/* total stdout bytes read         */
   unsigned char pre[2048];	/* raw stdout prefix, for replay   */
   size_t prelen;
+  int    sess;			/* task owns its pty as controlling
+				   terminal: signal keys go through
+				   its line discipline, not killpg */
 };
 static struct basht_cap caps[BASHT_MAX_CAPS];
 
@@ -137,6 +149,7 @@ next_instance (const char *name)
 
 /* pending capture between basht_fork_prepare() and the fork */
 static int  pend_slot = -1;
+static int  pend_solo;
 static char pend_sin[64], pend_sout[64], pend_serr[64];
 
 static int
@@ -249,9 +262,11 @@ cap_by_pid (pid_t pid)
 void
 basht_fork_prepare (const char *command, int flags)
 {
-  int i;
+  int i, solo;
   struct basht_cap *cp;
 
+  solo = basht_fork_solo;
+  basht_fork_solo = 0;		/* consumed either way */
   if (pend_slot >= 0)		/* stale (fork never completed) */
     {
       cap_free (&caps[pend_slot]);
@@ -299,7 +314,21 @@ basht_fork_prepare (const char *command, int flags)
   cp->out.mark = 0;
   cp->err.mark = '!';
   cp->out.lines = cp->err.lines = &cp->lines;
+  cp->sess = solo;		/* parent's copy of the decision */
+  pend_solo = solo;		/* the child's copy, via fork */
   pend_slot = i;
+}
+
+/* jobs.c asks: is this child taking its own session? The parent
+   half of the setpgid race dance must be skipped for it -- winning
+   that race would make the child a process-group leader, and a
+   group leader can never setsid. */
+int
+basht_sess_child (pid_t pid)
+{
+  struct basht_cap *cp = cap_by_pid (pid);
+
+  return cp != 0 && cp->sess;
 }
 
 /* Called in the parent right after fork. PID < 0: fork failed, free
@@ -379,13 +408,13 @@ static void fg_signal (pid_t, int);
 static void basht_cycle_owner (int);
 static pid_t fg_pid;		/* defined with the fg pump below */
 
-/* The in pty's master carries whatever the tty driver echoes for
-   input basht writes -- nothing else ever appears there. A raw
-   task that left ECHO on (cbreak readers: read -n1, menus) relies
-   on that echo to show the keystroke: feed it through the task's
-   stdout stream. In canonical mode the relay already displayed the
-   line, so the echo is discarded -- but always drained, so the
-   queue cannot back up. */
+/* The in pty's master carries the tty driver's echo of input basht
+   writes and, for a sessioned task, whatever the task itself
+   writes to /dev/tty (ssh and sudo prompts, getpass). Show it all
+   through the task's stdout stream, except in canonical-with-ECHO
+   mode: there it is the driver echoing a line the relay already
+   displayed. Always drained either way, so the queue cannot back
+   up. */
 static void
 drain_cap_in (struct basht_cap *cp)
 {
@@ -397,7 +426,7 @@ drain_cap_in (struct basht_cap *cp)
   if (cp->m_in < 0)
     return;
   show = tcgetattr (cp->m_in, &t) == 0
-	 && (t.c_lflag & ICANON) == 0 && (t.c_lflag & ECHO) != 0;
+	 && ((t.c_lflag & ICANON) == 0 || (t.c_lflag & ECHO) == 0);
   for (;;)
     {
       n = read (cp->m_in, buf, sizeof buf);
@@ -1007,10 +1036,17 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
       unsigned char c = (unsigned char)buf[k];
       if (key_escape (&rly->lb, c, cycles))
 	continue;
-      if (c == 0x03)		/* ^C */
-	fg_signal (cp->pid, SIGINT);
-      else if (c == 0x1a)		/* ^Z */
-	fg_signal (cp->pid, SIGTSTP);
+      if (c == 0x03 || c == 0x1a)	/* ^C, ^Z */
+	{
+	  /* a sessioned task's own line discipline delivers the
+	     signal to ITS foreground group (a nested shell's
+	     running job, not the shell); others get killpg, as
+	     the real terminal's driver would have */
+	  if (cp->sess && cp->m_in >= 0)
+	    basht_write_all (cp->m_in, &c, 1);
+	  else
+	    fg_signal (cp->pid, c == 0x03 ? SIGINT : SIGTSTP);
+	}
       else if (c == 0x04)		/* ^D */
 	{
 	  char e = 0x04;
@@ -1112,8 +1148,11 @@ relay_raw (struct basht_cap *cp, const char *buf, ssize_t n, int isig)
 	  mark = k;
 	  continue;
 	}
-      if (isig && (c == 0x03 || c == 0x1a))
+      if (isig && cp->sess == 0 && (c == 0x03 || c == 0x1a))
 	{
+	  /* no controlling pty: emulate the driver with killpg.
+	     Sessioned tasks get the bytes; their own line
+	     discipline signals their own foreground group. */
 	  if (k > mark && cp->m_in >= 0)
 	    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
 	  fg_signal (cp->pid, c == 0x03 ? SIGINT : SIGTSTP);
@@ -1798,16 +1837,19 @@ basht_init (void)
   if (basht_active || interactive_shell == 0)
     return;
 
-  /* Nested under another basht's capture: BASHT_LEVEL is exported
-     and our terminal is not a controlling tty we can own. Stay
-     plain -- the outer multiplexer displays this shell as a task,
-     and its raw pass-through gives our readline the keyboard. A
-     basht in a real terminal window can acquire the tty and
-     multiplexes as usual. */
+  /* Directly captured by an outer basht: our stdin IS the pty it
+     marked in the environment. Stay plain -- the outer multiplexer
+     displays this shell as a task, and its relay drives our
+     readline. A basht in a real terminal window (its own pty,
+     unmarked) multiplexes as usual. */
   {
-    const char *lvl = getenv ("BASHT_LEVEL");
-    if (lvl && *lvl && tcgetpgrp (0) < 0)
-      return;
+    const char *cap = getenv ("BASHT_CAPTURED");
+    if (cap && *cap)
+      {
+	char *tn = ttyname (0);
+	if (tn && strcmp (tn, cap) == 0)
+	  return;
+      }
   }
 
   t = dup (fileno (stderr));
@@ -1961,7 +2003,14 @@ basht_child_stdio (void)
     return;
   if (pend_slot >= 0)
     {
-      /* captured child: attach this task's pty slaves */
+      /* captured child: attach this task's pty slaves. A sole
+	 command becomes a session leader with the in pty as its
+	 controlling terminal, so /dev/tty resolves to the task's
+	 own pty (less, man, ssh password prompts) and a nested
+	 shell gets real job control (issue #15). Runs before the
+	 job-control setpgid in make_child, so setsid cannot fail;
+	 basht_child_sess tells jobs.c to skip that setpgid. */
+      int sess = pend_solo && setsid () >= 0;
       int in = open (pend_sin, O_RDWR | O_NOCTTY);
       int o = open (pend_sout, O_RDWR | O_NOCTTY);
       int e = open (pend_serr, O_RDWR | O_NOCTTY);
@@ -1976,6 +2025,26 @@ basht_child_stdio (void)
 	    close (o);
 	  if (e > 2)
 	    close (e);
+	  if (sess)
+	    {
+	      ioctl (0, TIOCSCTTY, 0);
+	      tcsetpgrp (0, getpid ());
+	      basht_child_sess = 1;
+	    }
+	  /* mark the exec environment: a basht finding its stdin
+	     to BE the marked pty knows it is a captured task and
+	     stays plain (see basht_init) */
+	  {
+	    extern char **export_env;
+	    char kv[96];
+	    int n;
+
+	    snprintf (kv, sizeof kv, "BASHT_CAPTURED=%s", pend_sin);
+	    n = strvec_len (export_env);
+	    export_env = strvec_resize (export_env, n + 2);
+	    export_env[n] = savestring (kv);
+	    export_env[n + 1] = 0;
+	  }
 	  return;
 	}
       if (in >= 0)
