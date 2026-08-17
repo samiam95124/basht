@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bashtypes.h"
@@ -110,7 +111,10 @@ struct basht_cap {
 				   every window resize             */
   int    w_up;			/* first report seen: bridge is up */
   int    w_hinted;		/* windowing failed; hint printed  */
+  time_t w_t0;			/* window spawned; bridge deadline */
+  char   wcmd[24];		/* terminal launched, for messages */
   char   wdir[64];		/* mkdtemp dir holding the fifos   */
+  size_t nfilt;			/* stdout bytes already filtered   */
   size_t nbytes;		/* total stdout bytes read         */
   unsigned char pre[2048];	/* raw stdout prefix, for replay   */
   size_t prelen;
@@ -452,9 +456,72 @@ drain_cap_in (struct basht_cap *cp)
    task's ptys and the window over a fifo pair. Bytes the task
    writes while the window is starting simply wait in the kernel
    pty queue -- basht stops reading, and the backed-up pty is all
-   the flow control needed. */
+   the flow control needed. Should the window never report in (the
+   terminal emulator missing or failing), the task falls back to
+   the tagged console with nothing lost. */
 
 static char self_exe[256];
+
+/* Is NAME an executable somewhere on PATH? */
+static int
+path_has (const char *name)
+{
+  const char *p = getenv ("PATH");
+  char buf[512];
+  size_t len, n = strlen (name);
+
+  if (p == 0)
+    p = "/usr/local/bin:/usr/bin:/bin";
+  while (*p)
+    {
+      const char *e = strchr (p, ':');
+      len = e ? (size_t)(e - p) : strlen (p);
+      if (len > 0 && len + n + 2 < sizeof buf)
+	{
+	  memcpy (buf, p, len);
+	  buf[len] = '/';
+	  strcpy (buf + len + 1, name);
+	  if (access (buf, X_OK) == 0)
+	    return 1;
+	}
+      p += len;
+      if (*p == ':')
+	p++;
+    }
+  return 0;
+}
+
+/* The command that opens a terminal window: $BASHT_TERMINAL, or the
+   first emulator found on PATH -- each candidate with the flags that
+   make it run the appended bridge invocation. Returns 0 when there
+   is no way to open a window here. */
+static const char *
+term_command (void)
+{
+  static const char *cand[] = {
+    "gnome-terminal --", "ptyxis --", "konsole -e",
+    "xfce4-terminal -x", "kitty", "alacritty -e", "foot",
+    "wezterm start --", "xterm -e", 0
+  };
+  const char *env = getenv ("BASHT_TERMINAL");
+  char name[64];
+  int i, k;
+
+  if (env && *env)
+    return env;
+  if (getenv ("DISPLAY") == 0 && getenv ("WAYLAND_DISPLAY") == 0)
+    return 0;			/* no GUI to open a window on */
+  for (i = 0; cand[i]; i++)
+    {
+      for (k = 0; cand[i][k] && cand[i][k] != ' '
+	   && k < (int)sizeof name - 1; k++)
+	name[k] = cand[i][k];
+      name[k] = '\0';
+      if (path_has (name))
+	return cand[i];
+    }
+  return 0;
+}
 
 /* Replay the prefix minus terminal queries (CSI ... n/c): the new
    terminal would answer them and the answers would arrive as
@@ -495,26 +562,20 @@ window_try (struct basht_cap *cp)
   char fo[96], fi[96], fw[96];
   char termbuf[256];
   char *targv[16];
-  int ntargv;
+  int ntargv, k;
   pid_t wpid;
-  unsigned char rep[sizeof cp->pre];
-  size_t replen;
   const char *termcmd;
 
-  if (cp->windowed || cp->pid <= 0)
+  if (cp->windowed || cp->w_hinted || cp->pid <= 0)
     return 0;
   /* only at the task's first breath: prefix complete, nothing
      displayed yet -- outside that, restarting or attaching would
      lose state, so just hint */
   if (cp->nbytes > sizeof cp->pre || cp->lines != 0)
     return 0;
-  termcmd = getenv ("BASHT_TERMINAL");
-  if (termcmd == 0 || *termcmd == '\0')
-    {
-      if (getenv ("DISPLAY") == 0 && getenv ("WAYLAND_DISPLAY") == 0)
-	return 0;		/* no GUI to open a window on */
-      termcmd = "gnome-terminal --";
-    }
+  termcmd = term_command ();
+  if (termcmd == 0)
+    return 0;
 
   strcpy (cp->wdir, "/tmp/basht.XXXXXX");
   if (mkdtemp (cp->wdir) == 0)
@@ -573,14 +634,17 @@ window_try (struct basht_cap *cp)
       _exit (127);
     }
 
-  /* replay the prefix (it ends at the trigger); the window's
-     terminal interprets it natively */
-  replen = scrub_queries (cp->pre, cp->prelen, rep);
-  basht_write_all (cp->w_out, rep, replen);
-
+  /* the launch is a wager until the bridge's first winsize report:
+     nothing is replayed or announced yet, and the task's output
+     waits in the kernel pty queue -- shuttle_windowed either
+     completes the move on that report or gives the console back
+     when the deadline passes */
+  for (k = 0; termcmd[k] && termcmd[k] != ' '
+       && k < (int)sizeof cp->wcmd - 1; k++)
+    cp->wcmd[k] = termcmd[k];
+  cp->wcmd[k] = '\0';
+  cp->w_t0 = time (0);
   cp->windowed = 1;
-  cp->w_was = 1;
-  basht_display_event (&cp->out, "full screen: moved to a window");
   return 1;
 }
 
@@ -596,7 +660,8 @@ shuttle_windowed (struct basht_cap *cp)
   ssize_t n;
 
   /* winsize reports: 4 bytes each, latest wins; the first one is
-     also the sign the bridge is up */
+     also the sign the bridge is up -- only then is the prefix
+     replayed and the move announced */
   while (cp->w_ws >= 0)
     {
       unsigned char wsb[4];
@@ -614,12 +679,44 @@ shuttle_windowed (struct basht_cap *cp)
 	      ioctl (cp->m_err, TIOCSWINSZ, &ws);
 	      fg_signal (cp->pid, SIGWINCH);
 	    }
-	  cp->w_up = 1;
+	  if (cp->w_up == 0)
+	    {
+	      /* replay the prefix (it ends at the trigger); the
+		 window's terminal interprets it natively */
+	      unsigned char rep[sizeof cp->pre];
+	      size_t replen = scrub_queries (cp->pre, cp->prelen, rep);
+	      basht_write_all (cp->w_out, rep, replen);
+	      cp->w_up = 1;
+	      cp->w_was = 1;
+	      basht_display_event (&cp->out,
+				   "full screen: moved to a window");
+	    }
 	  continue;
 	}
       if (n < 0 && errno == EINTR)
 	continue;
       break;			/* EAGAIN, EOF, or short read */
+    }
+
+  /* no report by the deadline: the terminal failed to launch (not
+     installed, exec error, no display server). Give the console
+     back -- everything the task wrote is still in the prefix and
+     the kernel pty queue, so nothing is lost; the unfiltered tail
+     of the prefix goes through the filter now. */
+  if (cp->w_up == 0 && time (0) - cp->w_t0 >= 5)
+    {
+      size_t k = cp->nfilt;
+      char cmd[sizeof cp->wcmd];
+
+      strcpy (cmd, cp->wcmd);
+      cap_window_close (cp);
+      cp->w_hinted = 1;		/* don't wager on this terminal again */
+      basht_display_event (&cp->out,
+	  "window failed (%s); staying on the console -- "
+	  "set BASHT_TERMINAL", cmd);
+      if (k < cp->prelen)
+	basht_filter_bytes (&cp->out, cp->pre + k, cp->prelen - k, 0);
+      return;
     }
 
   /* keyboard from the bridge */
@@ -646,8 +743,9 @@ shuttle_windowed (struct basht_cap *cp)
       return;
     }
 
-  /* task output to the window, only as fast as the fifo drains */
-  for (int which = 0; which < 2; which++)
+  /* task output to the window, only as fast as the fifo drains; not
+     at all until the bridge is up (the prefix must land first) */
+  for (int which = 0; cp->w_up && which < 2; which++)
     {
       int *fd = which ? &cp->m_err : &cp->m_out;
       while (*fd >= 0 && cp->w_out >= 0)
@@ -703,16 +801,24 @@ drain_cap_out (struct basht_cap *cp)
 	  while (done < (size_t)n)
 	    {
 	      int trig = 0;
-	      done += basht_filter_bytes (&cp->out, buf + done,
-					  (size_t)n - done, &trig);
+	      size_t took = basht_filter_bytes (&cp->out, buf + done,
+						(size_t)n - done, &trig);
+	      done += took;
+	      cp->nfilt += took;
 	      if (trig && window_try (cp))
 		return;		/* rest of chunk was in the prefix */
 	      if (trig && cp->w_hinted == 0)
 		{
+		  const char *tc = term_command ();
 		  cp->w_hinted = 1;
-		  basht_display_event (&cp->out,
-		      "full-screen program; try: gnome-terminal -- %s",
-		      cp->out.name);
+		  if (tc)
+		    basht_display_event (&cp->out,
+			"full-screen program; try: %s %s",
+			tc, cp->out.name);
+		  else
+		    basht_display_event (&cp->out,
+			"full-screen program; set BASHT_TERMINAL "
+			"to move it to a window");
 		}
 	    }
 	  continue;

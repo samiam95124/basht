@@ -136,8 +136,10 @@ window tracks resizes, and closing it hangs up the task. The
 command used to open the window is taken from
 .SM
 .B BASHT_TERMINAL
-(default
-.BR "gnome\-terminal \-\-" ).
+when set; otherwise the common terminal emulators are probed for on
+.BR PATH .
+If the window fails to open, the task stays on the tagged console
+with nothing lost.
 .PP
 Escape sequences never reach the real terminal from a task on the
 console: they are interpreted against the task's own line and
@@ -207,8 +209,14 @@ normally.
 .TP
 .B BASHT_TERMINAL
 The command prefix used to open a terminal window for a full-screen
-task, split on blanks. Default:
-.BR "gnome\-terminal \-\-" .
+task, split on blanks (for example
+.BR "gnome\-terminal \-\-" ,
+.BR "ptyxis \-\-" ,
+.BR "konsole \-e" ).
+When unset, the first of gnome\-terminal, ptyxis, konsole,
+xfce4\-terminal, kitty, alacritty, foot, wezterm or xterm found on
+.B PATH
+is used, with the flags each needs.
 .TP
 .B BASHT_DEBUG
 A file name; when set, basht appends a trace of everything touching
