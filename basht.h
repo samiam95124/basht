@@ -30,6 +30,10 @@ struct basht_linebuf {
   char   data[BASHT_LINEBUF_CAP];
   size_t len;                   /* logical line length            */
   size_t cur;                   /* cursor position, always <= len */
+  int    moved;                 /* cursor left this line (CUP, save/
+                                   restore, scroll): the content is
+                                   an abandoned in-place paint; the
+                                   next edit starts a fresh line   */
   size_t fix;                   /* immutable prefix: relay lines
                                    carry the task's echoed prompt
                                    here; never shipped or edited.

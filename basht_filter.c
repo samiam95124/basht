@@ -18,11 +18,28 @@ emit (BASHT_STREAM *ts)
   ts->lb.len = ts->lb.cur = 0;
 }
 
+/* The cursor left this line since the last edit (cursor
+   addressing, save/restore, scrolling): whatever was assembled is
+   an in-place paint the one-line model cannot place -- a progress
+   bar drawn at the screen bottom, say. It stays displayed as the
+   partial until the next edit, which starts a fresh line instead
+   of concatenating. */
+static void
+fresh (struct basht_linebuf *lb)
+{
+  if (lb->moved)
+    {
+      lb->len = lb->cur = 0;
+      lb->moved = 0;
+    }
+}
+
 static void
 putch (BASHT_STREAM *ts, char c)
 {
   struct basht_linebuf *lb = &ts->lb;
 
+  fresh (lb);
   /* on overflow force a line break; never drop bytes silently */
   if (lb->cur >= BASHT_LINEBUF_CAP - sizeof WRAP_MARK)
     {
@@ -51,11 +68,22 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
 	  if (c == 0x1b)
 	    lb->fs = BF_ESC;
 	  else if (c == '\n')
-	    emit (ts);
+	    {
+	      /* a newline on a line the cursor already left has no
+		 content of its own: discard the paint, emit nothing */
+	      if (lb->moved)
+		fresh (lb);
+	      else
+		emit (ts);
+	    }
 	  else if (c == '\r')
-	    lb->cur = 0;
+	    {
+	      fresh (lb);
+	      lb->cur = 0;
+	    }
 	  else if (c == '\b')
 	    {
+	      fresh (lb);
 	      if (lb->cur > 0)
 		lb->cur--;
 	    }
@@ -79,7 +107,12 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
 	  else if (c >= 0x20 && c <= 0x2f)
 	    ;			/* intermediate byte; stay */
 	  else
-	    lb->fs = BF_NORMAL;	/* two-char escape: consume both */
+	    {
+	      /* restore cursor / index / reverse index: row change */
+	      if (c == '8' || c == 'D' || c == 'M')
+		lb->moved = 1;
+	      lb->fs = BF_NORMAL;	/* two-char escape: consume both */
+	    }
 	  break;
 	case BF_CSI:
 	  if (c >= '0' && c <= '9' && lb->csi_more == 0)
@@ -91,7 +124,18 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
 	  else if (c >= 0x40 && c <= 0x7e)
 	    {			/* final byte */
 	      size_t nn = lb->csi_n > 0 ? (size_t)lb->csi_n : 1;
-	      size_t tail = lb->len - lb->cur;
+	      size_t tail;
+	      /* row-changing motions and scrolls: the cursor leaves
+		 this line (progress bars repaint via these) */
+	      if (c == 'A' || c == 'B' || c == 'E' || c == 'F'
+		  || c == 'H' || c == 'J' || c == 'S' || c == 'T'
+		  || c == 'd' || c == 'f' || c == 'r')
+		lb->moved = 1;
+	      /* in-line edits land on the line the cursor is on now */
+	      else if (c == 'K' || c == 'C' || c == 'D' || c == 'G'
+		       || c == 'P' || c == '@' || c == 'X')
+		fresh (lb);
+	      tail = lb->len - lb->cur;
 	      if (c == 'K')	/* erase to end of line */
 		lb->len = lb->cur;
 	      else if (c == 'C') /* cursor right */
@@ -156,8 +200,11 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
 void
 basht_filter_flush (BASHT_STREAM *ts)
 {
-  if (ts->lb.len > 0)
+  if (ts->lb.moved)
+    ts->lb.len = ts->lb.cur = 0;	/* abandoned paint: drop it */
+  else if (ts->lb.len > 0)
     emit (ts);
+  ts->lb.moved = 0;
   ts->lb.fs = BF_NORMAL;
   basht_display_partial (ts);	/* releases bottom-line ownership */
 }
