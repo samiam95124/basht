@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "basht.h"
@@ -22,8 +23,45 @@ static int term_fd = 1;
 
 static const BASHT_STREAM *bot;	   /* bottom-line owner, if any */
 static const BASHT_STREAM *def;	   /* default owner: task 0     */
-static size_t shown;		   /* chars drawn on bottom line */
+static size_t shown;		   /* columns drawn on bottom line */
 static int dirty;
+
+/* Display columns in N bytes of UTF-8: continuation bytes are
+   width-free (double-width glyphs are approximated at one). */
+static size_t
+count_cols (const char *s, size_t n)
+{
+  size_t i, c = 0;
+
+  for (i = 0; i < n; i++)
+    if (((unsigned char)s[i] & 0xc0) != 0x80)
+      c++;
+  return c;
+}
+
+/* Longest prefix of S (N bytes) that fits BUDGET columns, cut only
+   at character boundaries; *COLS gets its width. The bottom line
+   must never wrap: CR returns the cursor only to the start of its
+   last screen row, so a wrapped partial could never be erased --
+   full-width progress bars would strand a row per repaint. */
+static size_t
+clamp_cols (const char *s, size_t n, size_t budget, size_t *cols)
+{
+  size_t i = 0, c = 0;
+
+  while (i < n)
+    {
+      if (((unsigned char)s[i] & 0xc0) != 0x80)
+	{
+	  if (c == budget)
+	    break;
+	  c++;
+	}
+      i++;
+    }
+  *cols = c;
+  return i;
+}
 
 void
 basht_write_all (int fd, const void *buf, size_t n)
@@ -268,19 +306,29 @@ basht_display_sync (void)
   if (len > sizeof out - off)
     len = sizeof out - off;
   memcpy (out + off, ts->lb.data, len);
-  basht_write_all (term_fd, out, off + len);
-  shown = off + len;
 
-  /* park the terminal cursor at the stream's cursor column */
-  if (ts->lb.cur < len)
-    {
-      char bs[128];
-      memset (bs, '\b', sizeof bs);
-      for (size_t n = len - ts->lb.cur; n > 0;)
-	{
-	  size_t k = n < sizeof bs ? n : sizeof bs;
-	  basht_write_all (term_fd, bs, k);
-	  n -= k;
-	}
-    }
+  /* one screen row, no more: clamp to the terminal's width */
+  {
+    struct winsize ws;
+    size_t cols = 80, drawn;
+
+    if (ioctl (term_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+      cols = ws.ws_col;
+    drawn = clamp_cols (out, off + len, cols - 1, &shown);
+    basht_write_all (term_fd, out, drawn);
+
+    /* park the terminal cursor at the stream's cursor column */
+    if (off + ts->lb.cur < drawn)
+      {
+	char bs[128];
+	memset (bs, '\b', sizeof bs);
+	for (size_t n = count_cols (out + off + ts->lb.cur,
+				    drawn - off - ts->lb.cur); n > 0;)
+	  {
+	    size_t k = n < sizeof bs ? n : sizeof bs;
+	    basht_write_all (term_fd, bs, k);
+	    n -= k;
+	  }
+      }
+  }
 }
