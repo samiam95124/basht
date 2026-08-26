@@ -164,11 +164,14 @@ basht_filter_bytes (BASHT_STREAM *ts, const unsigned char *buf,
 	      else if (c == 'X') /* erase chars in place */
 		memset (lb->data + lb->cur, ' ', nn > tail ? tail : nn);
 	      lb->fs = BF_NORMAL;
-	      /* alternate-screen enable: this task is a full-screen
-		 program; let the caller move it into a window */
+	      /* full-screen program: the alternate screen (vim, less,
+		 htop) or focus tracking, which only a program driving
+		 the whole terminal asks for -- inline TUIs (the claude
+		 CLI) never leave the primary screen but do want focus
+		 events. Let the caller move it into a window. */
 	      if (trigger && c == 'h' && lb->csi_priv
 		  && (lb->csi_n == 1049 || lb->csi_n == 1047
-		      || lb->csi_n == 47))
+		      || lb->csi_n == 47 || lb->csi_n == 1004))
 		{
 		  *trigger = 1;
 		  basht_display_partial (ts);
