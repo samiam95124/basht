@@ -129,11 +129,13 @@ and
 browse the shell history on it, and Enter queues the line to run
 when the prompt returns.
 .SH FULL-SCREEN PROGRAMS
-A task that enables the terminal's alternate screen (vim, less,
-htop) is detected at its first escape sequence and moved into its
-own terminal window; the console never stops multiplexing. The
-window tracks resizes, and closing it hangs up the task. The
-command used to open the window is taken from
+A task that takes over the terminal -- by enabling the alternate
+screen (vim, less, htop), or by asking for focus tracking, as
+inline TUIs that stay on the primary screen do -- is detected at
+its first escape sequence and moved into its own terminal window;
+the console never stops multiplexing. The window tracks resizes,
+and closing it hangs up the task. The command used to open the
+window is taken from
 .SM
 .B BASHT_TERMINAL
 when set; otherwise the common terminal emulators are probed for on
@@ -145,7 +147,7 @@ Escape sequences never reach the real terminal from a task on the
 console: they are interpreted against the task's own line and
 otherwise discarded.
 .SH BUILTINS
-basht adds two builtins to those described in
+basht adds four builtins to those described in
 .BR bash (1):
 .TP
 \fBfeed\fP \fIname\fP[:\fIn\fP] \fItext\fP ...
@@ -168,6 +170,51 @@ task output. In non-interactive shells and subshells the builtin
 writes the ANSI clear sequence to standard output, which is stock
 .BR clear (1)
 behavior.
+.TP
+\fBtask\fP [\fB0\fP | \fB1\fP]
+Turn tasking mode off (\fB0\fP) or back on (\fB1\fP); with no
+argument, print 1 when it is on and 0 when it is off. Tasking mode
+is on by default in interactive shells \(em it is the multiplexer
+this page describes. With it off, basht is stock
+.BR bash (1):
+jobs inherit the real terminal instead of a pty, their output
+reaches the screen unfiltered and untagged, and a foreground job
+takes the terminal the usual way. The shell's own pty is kept
+across the change, so task 0's line numbering and instance counts
+continue where they left off when tasking is turned back on.
+.IP
+Turning tasking off is refused while any task is still running:
+their ptys would have no reader and the tasks would block on the
+first full output buffer. Wait for them, or leave tasking on. Only
+the multiplexing shell itself may change the mode \(em a subshell
+that tries gets an error, and shells that never had a multiplexer
+(non-interactive ones, or one already captured by an outer basht)
+cannot turn it on.
+.TP
+\fBterm\fP [\fIcommand\fP [\fIargument\fP ...]]
+Open a terminal window running \fIcommand\fP with its
+\fIargument\fPs \(em
+.B term bash
+opens plain bash in a new window. With no \fIcommand\fP the shell
+named by
+.B SHELL
+is run. The emulator is chosen exactly as it is for a full-screen
+task:
+.B BASHT_TERMINAL
+when set, otherwise the first emulator found on
+.BR PATH ,
+so both always land in the same one. The command and its arguments
+are passed to the emulator as separate arguments and are never
+re-parsed or word-split.
+.IP
+The window is detached \(em its own session, so it neither takes
+signals aimed at the shell's foreground job nor dies with the
+shell \(em and it is not a task: nothing about it appears in the
+job table or on the tagged console, and
+.B term
+returns as soon as the emulator is launched rather than waiting
+for the window. Failure means no emulator could be found or run;
+whether \fIcommand\fP itself starts is the emulator's to report.
 .SH SHELL VARIABLES
 .TP
 .B PST1
@@ -208,15 +255,19 @@ normally.
 .SH ENVIRONMENT
 .TP
 .B BASHT_TERMINAL
-The command prefix used to open a terminal window for a full-screen
-task, split on blanks (for example
+The command prefix used to open a terminal window \(em for a
+full-screen task, or for the
+.B term
+builtin \(em split on blanks (for example
 .BR "gnome\-terminal \-\-" ,
 .BR "ptyxis \-\-" ,
 .BR "konsole \-e" ).
 When unset, the first of gnome\-terminal, ptyxis, konsole,
 xfce4\-terminal, kitty, alacritty, foot, wezterm or xterm found on
 .B PATH
-is used, with the flags each needs.
+is used, with the flags each needs. A value set here is taken as
+given: it overrides the probe entirely, including its check that
+there is a display to open a window on.
 .TP
 .B BASHT_DEBUG
 A file name; when set, basht appends a trace of everything touching
