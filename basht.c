@@ -88,6 +88,15 @@ dbgch (int c)
 static BASHT_STREAM self;	/* task 0 */
 static int self_master = -1;	/* master side of task 0's pty */
 
+/* This process is the multiplexing shell, the one whose fds 1/2 are
+   task 0's pty and whose forks become tasks. Cleared in every
+   forked child (basht_child_stdio), because a subshell's own
+   children are its internal plumbing, not tasks: a command
+   substitution redirects fd 1 to its capture pipe, and a child
+   captured onto a task pty there would send the substitution's
+   output to the display and hand the caller an empty string. */
+static int self_shell;
+
 /* Captured tasks. Every job-table child (foreground or background;
    not comsub/procsub) gets an in, an out and an err pty; the
    masters are drained here and displayed as tagged lines. Pipes and
@@ -262,7 +271,9 @@ cap_by_pid (pid_t pid)
 
 /* Called in the parent just before fork. Decides whether this child
    is captured and allocates its ptys. Only async, job-table,
-   interactive children qualify (no comsub/procsub). */
+   interactive children of the multiplexing shell itself qualify --
+   no comsub/procsub, and nothing forked by a subshell, whose fds
+   are already the caller's plumbing. */
 void
 basht_fork_prepare (const char *command, int flags)
 {
@@ -276,7 +287,8 @@ basht_fork_prepare (const char *command, int flags)
       cap_free (&caps[pend_slot]);
       pend_slot = -1;
     }
-  if (basht_active == 0 || (flags & (FORK_COMSUB | FORK_PROCSUB)))
+  if (basht_active == 0 || self_shell == 0
+      || (flags & (FORK_COMSUB | FORK_PROCSUB)))
     return;
 
   for (i = 0; i < BASHT_MAX_CAPS; i++)
@@ -2049,6 +2061,7 @@ basht_init (void)
       }
   }
 
+  self_shell = 1;
   basht_active = 1;
 }
 
@@ -2107,6 +2120,13 @@ basht_child_stdio (void)
 {
   if (basht_active == 0 || basht_tty < 0)
     return;
+  /* Only the multiplexing shell's own children are tasks. Forked
+     from a subshell, fds 1/2 are whatever that subshell arranged
+     -- a command substitution's capture pipe, most importantly --
+     and are not ours to redirect. */
+  if (self_shell == 0)
+    return;
+  self_shell = 0;		/* this child's own forks are not tasks */
   if (pend_slot >= 0)
     {
       /* captured child: attach this task's pty slaves. A sole
