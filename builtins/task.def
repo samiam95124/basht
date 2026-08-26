@@ -1,0 +1,117 @@
+This file is task.def, from which is created task.c.
+It implements the builtin "task" in Bash.
+
+Copyright (C) 2026 Free Software Foundation, Inc.
+
+This file is part of GNU Bash, the Bourne Again SHell.
+
+Bash is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Bash is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+
+$PRODUCES task.c
+
+$BUILTIN task
+$FUNCTION task_builtin
+$SHORT_DOC task [0 | 1]
+Enable or disable tasking mode.
+
+Tasking mode is the multiplexed tagged display: every job runs on
+its own pty, its output is filtered into whole lines and shown
+under a task tag, and the shell itself is task 0. It is on by
+default in interactive shells.
+
+  task 0	stand the multiplexer down
+  task 1	bring it back up
+
+With no argument, prints 1 if tasking is on and 0 if it is off.
+
+While tasking is off the shell behaves as stock bash: jobs inherit
+the real terminal, write to it directly, and take it in the
+foreground the usual way. Nothing about a task's own output is
+buffered across the change -- `task 0' is refused while any task is
+still running, because no one would be left to drain their ptys.
+
+Exit Status:
+Returns success unless an invalid argument is given, tasks are
+running, or the multiplexer is unavailable in this shell.
+$END
+
+#include <config.h>
+
+#if defined (HAVE_UNISTD_H)
+#  include <unistd.h>
+#endif
+
+#include <stdio.h>
+
+#include "../bashintl.h"
+#include "../shell.h"
+#include "../basht.h"
+#include "common.h"
+#include "bashgetopt.h"
+
+int
+task_builtin (WORD_LIST *list)
+{
+  intmax_t mode;
+  char *w;
+  int opt;
+
+  reset_internal_getopt ();
+  while ((opt = internal_getopt (list, "")) != -1)
+    {
+      switch (opt)
+	{
+	CASE_HELPOPT;
+	default:
+	  builtin_usage ();
+	  return (EX_USAGE);
+	}
+    }
+  list = loptend;
+
+  if (list == 0)
+    {
+      printf ("%d\n", basht_active ? 1 : 0);
+      fflush (stdout);
+      return (EXECUTION_SUCCESS);
+    }
+  if (list->next)
+    {
+      builtin_usage ();
+      return (EX_USAGE);
+    }
+
+  w = list->word->word;
+  if (valid_number (w, &mode) == 0 || (mode != 0 && mode != 1))
+    {
+      builtin_error (_("%s: tasking mode must be 0 or 1"), w);
+      return (EXECUTION_FAILURE);
+    }
+
+  switch (basht_set_tasking ((int) mode))
+    {
+    case BASHT_TASK_OK:
+      return (EXECUTION_SUCCESS);
+    case BASHT_TASK_BUSY:
+      builtin_error (_("tasks are still running; wait for them to finish"));
+      break;
+    case BASHT_TASK_NOTSHELL:
+      builtin_error (_("only the multiplexing shell can change tasking mode"));
+      break;
+    default:
+      builtin_error (_("tasking mode is not available in this shell"));
+      break;
+    }
+  return (EXECUTION_FAILURE);
+}

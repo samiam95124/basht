@@ -90,6 +90,18 @@ tags off entirely; `unset PST1` restores the default.
   scrollback). Tasks cannot clear the screen — escape sequences in task
   output never reach the terminal, and that includes `clear` run in the
   background.
+- **`task 0` / `task 1`**: turn tasking mode off and back on (bare `task`
+  reports which it is). Off, basht is stock bash — jobs inherit the real
+  terminal, output arrives unfiltered and untagged, foreground jobs take
+  the terminal the usual way. The shell's own pty is kept across the
+  change, so tags pick up their numbering where they left off. Turning it
+  off is refused while tasks are running: nothing would drain their ptys.
+- **`term [command ...]`**: open a terminal window running a command —
+  `term bash` gets you plain bash in a new window, bare `term` your
+  `$SHELL`. The emulator is picked the same way the auto-window picks it
+  (`$BASHT_TERMINAL`, else the first one on `PATH`), arguments are passed
+  through without re-parsing, and the window is detached: its own
+  session, not a task, nothing on the tagged console.
 - **Full-screen programs get a window**: a task that enables the alternate
   screen (vim, less, htop) is detected at its first escape and moved into
   its own terminal window automatically — the console never stops

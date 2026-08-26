@@ -1,0 +1,118 @@
+This file is term.def, from which is created term.c.
+It implements the builtin "term" in Bash.
+
+Copyright (C) 2026 Free Software Foundation, Inc.
+
+This file is part of GNU Bash, the Bourne Again SHell.
+
+Bash is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Bash is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+
+$PRODUCES term.c
+
+$BUILTIN term
+$FUNCTION term_builtin
+$SHORT_DOC term [command [argument ...]]
+Open a terminal window running a command.
+
+Launches a terminal emulator and runs COMMAND with its ARGUMENTs
+inside it: `term bash' opens plain bash in a new window. With no
+COMMAND, the shell named by $SHELL is run, or /bin/sh when $SHELL
+is unset.
+
+The emulator is $BASHT_TERMINAL when that is set -- a command
+prefix split on blanks, such as `ptyxis --' or `konsole -e' -- and
+otherwise the first of gnome-terminal, ptyxis, konsole,
+xfce4-terminal, kitty, alacritty, foot, wezterm or xterm found
+on PATH, with the flags each one needs. This is the same
+discovery that moves a full-screen task into its own window, so
+both always land in the same emulator.
+
+The window is detached: it has its own session, so it neither
+takes signals aimed at the shell's foreground job nor dies with
+the shell. term returns as soon as the emulator is launched and
+does not wait for it, and the window is not a task -- its output
+belongs to the window, not the tagged console.
+
+Exit Status:
+Returns success once the emulator has been launched. Because term
+does not wait for the window, whether COMMAND itself runs is
+reported by the emulator, not here; failure means no emulator
+could be found or run at all.
+$END
+
+#include <config.h>
+
+#if defined (HAVE_UNISTD_H)
+#  include <unistd.h>
+#endif
+
+#include "../bashintl.h"
+#include "../shell.h"
+#include "../basht.h"
+#include "common.h"
+#include "bashgetopt.h"
+
+int
+term_builtin (WORD_LIST *list)
+{
+  char **argv, *fallback[2];
+  int opt;
+  pid_t pid;
+
+  reset_internal_getopt ();
+  while ((opt = internal_getopt (list, "")) != -1)
+    {
+      switch (opt)
+	{
+	CASE_HELPOPT;
+	default:
+	  builtin_usage ();
+	  return (EX_USAGE);
+	}
+    }
+  list = loptend;
+
+  if (list)
+    argv = strvec_from_word_list (list, 0, 0, (int *)NULL);
+  else
+    {
+      /* no command: the user's shell, as an emulator's own default
+	 would be -- but named explicitly, since the `-e' style
+	 candidates cannot be launched with nothing after the flag */
+      fallback[0] = get_string_value ("SHELL");
+      if (fallback[0] == 0 || *fallback[0] == '\0')
+	fallback[0] = "/bin/sh";
+      fallback[1] = (char *)NULL;
+      argv = fallback;
+    }
+
+  pid = basht_term_spawn (argv);
+
+  if (argv != fallback)
+    free (argv);		/* the words themselves are the list's */
+
+  switch (pid)
+    {
+    case BASHT_TERM_NOTERM:
+      builtin_error (_("no terminal emulator found; set BASHT_TERMINAL"));
+      return (EXECUTION_FAILURE);
+    case BASHT_TERM_TOOMANY:
+      builtin_error (_("too many arguments"));
+      return (EXECUTION_FAILURE);
+    case BASHT_TERM_FORK:
+      builtin_error (_("cannot fork"));
+      return (EXECUTION_FAILURE);
+    }
+  return (EXECUTION_SUCCESS);
+}

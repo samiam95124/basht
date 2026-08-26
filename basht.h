@@ -102,6 +102,28 @@ int  basht_send_input (const char *, int, const char *);
 int  basht_console_clear (int keep);
                                 /* `clear' builtin: 1 = cleared; 0 =
                                    caller falls back to stdout */
+
+/* `task' builtin: stand the multiplexer down (0) or back up (1).
+   Tasking is on by default; standing down puts the real terminal
+   back on fds 1/2 so jobs run uncaptured, as in stock bash. */
+#define BASHT_TASK_OK        0
+#define BASHT_TASK_BUSY    (-1)	/* tasks live; nothing would drain
+				   their ptys, so the stand-down is
+				   refused rather than wedging them */
+#define BASHT_TASK_NOTSHELL (-2) /* a subshell asked; only the
+				   multiplexing shell may decide  */
+#define BASHT_TASK_FAILED  (-3)	/* could not be brought up here   */
+int  basht_set_tasking (int on);
+
+/* `term' builtin: open a terminal window running ARGV (a command
+   and its arguments, NULL-terminated). The terminal is
+   $BASHT_TERMINAL, else the first emulator found on PATH -- the
+   same discovery the auto-window uses. Returns the launched pid,
+   or one of: */
+#define BASHT_TERM_NOTERM  (-1)	/* no terminal emulator to run    */
+#define BASHT_TERM_TOOMANY (-2)	/* more arguments than fit        */
+#define BASHT_TERM_FORK    (-3)	/* fork failed                    */
+pid_t basht_term_spawn (char **argv);
 int  basht_bridge_main (const char *, const char *, const char *);
                                 /* --basht-bridge: run inside the
                                    spawned terminal window */

@@ -535,6 +535,73 @@ term_command (void)
   return 0;
 }
 
+/* `term' builtin: open a terminal window running ARGV. Shares
+   term_command with the auto-window, so an explicit `term' and a
+   task that went full-screen always land in the same emulator.
+
+   The window is detached: setsid in the child gives it its own
+   session, so it does not take ^C aimed at the shell's foreground
+   process group and does not die with the shell's terminal. Its
+   stdio is inherited, which under a live multiplexer means the
+   emulator's own diagnostics arrive tagged as task 0's output.
+   Nothing waits for it -- bash's own reaper collects the child
+   when the emulator exits. */
+pid_t
+basht_term_spawn (char **argv)
+{
+  char termbuf[256];
+  char *targv[128];
+  const int maxargv = (int)(sizeof targv / sizeof targv[0]) - 1;
+  int ntargv = 0, i;
+  const char *termcmd;
+  char *tok;
+  pid_t pid;
+
+  termcmd = term_command ();
+  if (termcmd == 0)
+    return BASHT_TERM_NOTERM;
+
+  strncpy (termbuf, termcmd, sizeof termbuf - 1);
+  termbuf[sizeof termbuf - 1] = '\0';
+  for (tok = strtok (termbuf, " \t"); tok; tok = strtok (0, " \t"))
+    {
+      if (ntargv >= 16)
+	return BASHT_TERM_TOOMANY;
+      targv[ntargv++] = tok;
+    }
+  if (ntargv == 0)
+    return BASHT_TERM_NOTERM;
+
+  /* $BASHT_TERMINAL is taken verbatim by term_command, and the
+     PATH probe only ever checked the candidates: make sure this
+     one is really runnable before forking, so a typo is an error
+     here rather than a window that never appears. */
+  if (strchr (targv[0], '/')
+      ? access (targv[0], X_OK) != 0
+      : path_has (targv[0]) == 0)
+    return BASHT_TERM_NOTERM;
+
+  for (i = 0; argv && argv[i]; i++)
+    {
+      if (ntargv >= maxargv)
+	return BASHT_TERM_TOOMANY;
+      targv[ntargv++] = argv[i];
+    }
+  targv[ntargv] = 0;
+
+  pid = fork ();
+  if (pid < 0)
+    return BASHT_TERM_FORK;
+  if (pid == 0)
+    {
+      setsid ();
+      execvp (targv[0], targv);
+      _exit (127);
+    }
+  dbg ("term: %s -> pid %d", targv[0], (int)pid);
+  return pid;
+}
+
 /* Replay the prefix minus terminal queries (CSI ... n/c): the new
    terminal would answer them and the answers would arrive as
    phantom keystrokes. */
@@ -1821,14 +1888,16 @@ basht_cycle_owner (int dir)
 static int
 rl_basht_cycle_right (int count, int key)
 {
-  basht_cycle_owner (1);
+  if (basht_active)
+    basht_cycle_owner (1);
   return 0;
 }
 
 static int
 rl_basht_cycle_left (int count, int key)
 {
-  basht_cycle_owner (-1);
+  if (basht_active)
+    basht_cycle_owner (-1);
   return 0;
 }
 
@@ -1840,6 +1909,11 @@ static int
 basht_getc (FILE *stream)
 {
   int fd = fileno (stream);
+
+  /* stood down (`task 0'): the hook stays installed, but readline
+     reads the real terminal directly, as it would in stock bash */
+  if (basht_active == 0)
+    return rl_getc (stream);
 
   /* the console is ours while readline is reading: the task-0 tag
      line (the prompt) may own the bottom of the screen again */
@@ -2063,6 +2137,110 @@ basht_init (void)
 
   self_shell = 1;
   basht_active = 1;
+}
+
+/* ---- `task' builtin: stand the multiplexer down and back up -----
+
+   Tasking is on by default -- basht_init runs at shell startup.
+   `task 0' puts the real terminal back on fds 1/2 and clears
+   basht_active, which is the flag every hook already tests: jobs
+   fork uncaptured, the keyboard relay and the fg pump step aside,
+   and jobs.c hands the terminal to foreground jobs again. The
+   result is stock bash. `task 1' undoes it.
+
+   The self pty survives the gap. Its slave is only reachable
+   through fds 1/2 (basht_init closes the open once it has dup2'd
+   them), so standing down saves those as close-on-exec dups before
+   the real tty goes over them -- the same trick
+   basht_exec_prepare uses -- and standing back up is a pair of
+   dup2s rather than a second init. That matters: re-running
+   basht_init would allocate a fresh pty, renumber task 0 and bump
+   BASHT_LEVEL.
+
+   Captured tasks cannot outlive the multiplexer. Nothing would
+   drain their masters and they would wedge as soon as a pty buffer
+   filled, so a stand-down is refused while any are live rather
+   than silently stranding them. */
+static int susp_out = -1, susp_err = -1;
+
+static int
+live_caps (void)
+{
+  int i, n = 0;
+
+  for (i = 0; i < BASHT_MAX_CAPS; i++)
+    if (caps[i].out.id != 0)
+      n++;
+  return n;
+}
+
+int
+basht_set_tasking (int on)
+{
+  if (on)
+    {
+      if (basht_active)
+	return BASHT_TASK_OK;
+
+      /* stood down earlier in this shell: swap the self pty back */
+      if (susp_out >= 0 && susp_err >= 0 && self.pid == getpid ())
+	{
+	  dup2 (susp_out, 1);
+	  dup2 (susp_err, 2);
+	  close (susp_out);
+	  close (susp_err);
+	  susp_out = susp_err = -1;
+	  setvbuf (stdout, 0, _IOLBF, 0);
+	  setvbuf (stderr, 0, _IONBF, 0);
+	  basht_display_set_terminal (basht_tty);
+	  basht_display_set_default (&self);
+	  basht_active = 1;
+	  dbg ("tasking on (resumed)");
+	  return BASHT_TASK_OK;
+	}
+
+      /* never came up here: try now. Fails for the shells that
+	 have no multiplexer to give -- non-interactive, or already
+	 captured by an outer basht. */
+      basht_init ();
+      return basht_active ? BASHT_TASK_OK : BASHT_TASK_FAILED;
+    }
+
+  if (basht_active == 0)
+    return BASHT_TASK_OK;
+  if (getpid () != self.pid)
+    return BASHT_TASK_NOTSHELL;
+  if (live_caps ())
+    return BASHT_TASK_BUSY;
+
+  basht_drain ();
+  fflush (stdout);
+  fflush (stderr);
+
+  /* give the console back: erase the bottom line and leave no tag
+     behind, so the first stock prompt starts on a clean row */
+  basht_display_set_owner (0);
+  basht_display_set_default (0);
+  basht_display_sync ();
+
+  susp_out = fcntl (1, F_DUPFD_CLOEXEC, 10);
+  susp_err = fcntl (2, F_DUPFD_CLOEXEC, 10);
+  if (susp_out < 0 || susp_err < 0)
+    {
+      if (susp_out >= 0)
+	close (susp_out);
+      if (susp_err >= 0)
+	close (susp_err);
+      susp_out = susp_err = -1;
+      return BASHT_TASK_FAILED;
+    }
+  dup2 (basht_tty, 1);
+  dup2 (basht_tty, 2);
+  setvbuf (stdout, 0, _IOLBF, 0);
+  setvbuf (stderr, 0, _IONBF, 0);
+  basht_active = 0;
+  dbg ("tasking off (stood down)");
+  return BASHT_TASK_OK;
 }
 
 /* The exec builtin is about to replace this shell (issue #5): fds

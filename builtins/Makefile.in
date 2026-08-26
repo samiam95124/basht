@@ -153,7 +153,8 @@ DEFSRC =  $(srcdir)/alias.def $(srcdir)/bind.def $(srcdir)/break.def \
 	  $(srcdir)/ulimit.def $(srcdir)/umask.def $(srcdir)/wait.def \
 	  $(srcdir)/reserved.def $(srcdir)/pushd.def $(srcdir)/shopt.def \
 	  $(srcdir)/printf.def $(srcdir)/complete.def $(srcdir)/mapfile.def \
-	  $(srcdir)/feed.def $(srcdir)/clear.def
+	  $(srcdir)/feed.def $(srcdir)/clear.def \
+	  $(srcdir)/task.def $(srcdir)/term.def
 
 STATIC_SOURCE = common.c evalstring.c evalfile.c getopt.c bashgetopt.c \
 		getopt.h 
@@ -166,7 +167,7 @@ OFILES = builtins.o \
 	pushd.o read.o return.o set.o setattr.o shift.o source.o \
 	suspend.o test.o times.o trap.o type.o ulimit.o umask.o \
 	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o \
-	feed.o clear.o
+	feed.o clear.o task.o term.o
 
 CREATED_FILES = builtext.h builtins.c psize.aux pipesize.h tmpbuiltins.c \
 	tmpbuiltins.h
@@ -295,6 +296,8 @@ ${LIBINTL_H}:
 alias.o: alias.def
 feed.o: feed.def
 clear.o: clear.def
+task.o: task.def
+term.o: term.def
 bind.o: bind.def
 break.o: break.def
 builtin.o: builtin.def
