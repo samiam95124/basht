@@ -287,6 +287,41 @@ and
 work on the console. Pipeline stages share the job's process group
 and have no controlling terminal.
 .PP
+Keystrokes are delivered to whichever of the task's three ptys it
+reads them from. Normally that is the input pty; a task that puts its
+stderr (or stdout) pty into non-canonical mode while its input pty
+stays canonical is reading keys there instead --
+.B less
+(and so
+.BR man )
+opens
+.BR ttyname (2),
+the stderr device, rather than
+.BR /dev/tty .
+Signal keys typed at a pty that is not the task's controlling
+terminal are delivered with
+.BR killpg (3),
+as a real terminal's driver would.
+.PP
+A pager is a full-screen program as far as the terminal can tell:
+.B less
+enables the alternate screen at startup, so
+.B man
+is moved to a window like
+.BR vim .
+To keep pages on the tagged console, where they read like
+.B more
+(a screenful of lines, space for the next, q to quit), stop
+.B less
+from initializing the terminal:
+.B MANPAGER='less \-X'
+for
+.B man
+alone, or
+.B LESS=\-RX
+for every use of
+.BR less .
+.PP
 Nested interactive shells still run without job control: bash
 locates its job-control terminal through standard error, which is
 a separate capture pty, so

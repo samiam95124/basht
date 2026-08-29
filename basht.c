@@ -474,6 +474,11 @@ drain_cap_in (struct basht_cap *cp)
 
 static char self_exe[256];
 
+/* keyboard routing, defined with the foreground pump below */
+static int  cap_stdin_raw (struct basht_cap *, int *);
+static void relay_raw (struct basht_cap *, const char *, ssize_t, int,
+		       int);
+
 /* Is NAME an executable somewhere on PATH? */
 static int
 path_has (const char *name)
@@ -798,14 +803,17 @@ shuttle_windowed (struct basht_cap *cp)
       return;
     }
 
-  /* keyboard from the bridge */
+  /* keyboard from the bridge: onto whichever pty the task reads
+     keys from; the bridge's terminal runs with ISIG off, so signal
+     keys arrive as bytes and are routed as the console's are */
   while (cp->w_in >= 0)
     {
       n = read (cp->w_in, buf, sizeof buf);
       if (n > 0)
 	{
-	  if (cp->m_in >= 0)
-	    basht_write_all (cp->m_in, buf, (size_t)n);
+	  int isig;
+	  cap_stdin_raw (cp, &isig);
+	  relay_raw (cp, (const char *)buf, n, isig, 0);
 	  continue;
 	}
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -1083,6 +1091,8 @@ ta_history (int dir)
 static BASHT_STREAM prompt_rly;
 static int rslot;
 static void prompt_relay_bind (struct basht_cap *);
+static int  cap_key_fd (struct basht_cap *);
+static int  key_signals_here (struct basht_cap *, int);
 
 static void
 fg_signal (pid_t pid, int sig)
@@ -1216,6 +1226,8 @@ static void
 relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	     const char *buf, ssize_t n, int cycles)
 {
+  int fd = cap_key_fd (cp);
+
   for (ssize_t k = 0; k < n; k++)
     {
       unsigned char c = (unsigned char)buf[k];
@@ -1223,29 +1235,25 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
 	continue;
       if (c == 0x03 || c == 0x1a)	/* ^C, ^Z */
 	{
-	  /* a sessioned task's own line discipline delivers the
-	     signal to ITS foreground group (a nested shell's
-	     running job, not the shell); others get killpg, as
-	     the real terminal's driver would have */
-	  if (cp->sess && cp->m_in >= 0)
-	    basht_write_all (cp->m_in, &c, 1);
-	  else
+	  if (key_signals_here (cp, fd))
 	    fg_signal (cp->pid, c == 0x03 ? SIGINT : SIGTSTP);
+	  else
+	    basht_write_all (fd, &c, 1);
 	}
       else if (c == 0x04)		/* ^D */
 	{
 	  char e = 0x04;
-	  if (cp->m_in >= 0)
-	    basht_write_all (cp->m_in, &e, 1);
+	  if (fd >= 0)
+	    basht_write_all (fd, &e, 1);
 	}
       else if (c == '\r' || c == '\n')
 	{
 	  relay_prefix (cp, rly);
 	  basht_display_line (rly, rly->lb.data, rly->lb.len);
-	  if (cp->m_in >= 0)
+	  if (fd >= 0)
 	    {
 	      rly->lb.data[rly->lb.len] = '\n';
-	      basht_write_all (cp->m_in, rly->lb.data + rly->lb.fix,
+	      basht_write_all (fd, rly->lb.data + rly->lb.fix,
 			       rly->lb.len - rly->lb.fix + 1);
 	    }
 	  rly->lb.len = rly->lb.cur = rly->lb.fix = 0;
@@ -1285,18 +1293,44 @@ relay_chars (struct basht_cap *cp, BASHT_STREAM *rly,
     }
 }
 
-/* The task's stdin discipline, read from its in pty (a pty pair
-   shares one termios, so the master sees the slave's settings).
+/* The pty the task takes its keyboard from. Normally the in pty;
+   but a task that has put its err (or out) pty into non-canonical
+   mode while the in pty stays canonical is reading keys THERE:
+   less (since 581) opens ttyname(2) rather than /dev/tty, and
+   older pagers fall back to fd 2 when /dev/tty fails -- on a real
+   terminal all three are one device, under basht they are three
+   ptys, and the keystrokes must land on the one being read (man
+   froze: q went to the in pty, less listened on the err pty). A
+   pty pair shares one termios, so the master sees the slave's
+   settings. -1 when the task has no pty left to type at. */
+static int
+cap_key_fd (struct basht_cap *cp)
+{
+  struct termios t;
+  int fds[3], i;
+
+  fds[0] = cp->m_in;
+  fds[1] = cp->m_err;
+  fds[2] = cp->m_out;
+  for (i = 0; i < 3; i++)
+    if (fds[i] >= 0 && tcgetattr (fds[i], &t) == 0
+	&& (t.c_lflag & ICANON) == 0)
+      return fds[i];
+  return cp->m_in;
+}
+
+/* The task's keyboard discipline, read from its keyboard pty.
    Nonzero = non-canonical: the task reads keystrokes, not lines --
-   readline programs (nested shells, ssh, REPLs) live here. ISIG
-   is reported so signal keys can be handled as the tty driver
-   would have. */
+   readline programs (nested shells, ssh, REPLs) and pagers live
+   here. ISIG is reported so signal keys can be handled as the tty
+   driver would have. */
 static int
 cap_stdin_raw (struct basht_cap *cp, int *isig)
 {
   struct termios t;
+  int fd = cap_key_fd (cp);
 
-  if (cp->m_in < 0 || tcgetattr (cp->m_in, &t) < 0)
+  if (fd < 0 || tcgetattr (fd, &t) < 0)
     {
       if (isig)
 	*isig = 1;
@@ -1307,39 +1341,55 @@ cap_stdin_raw (struct basht_cap *cp, int *isig)
   return (t.c_lflag & ICANON) == 0;
 }
 
+/* Where a signal key typed at CP goes. The in pty is the task's
+   controlling terminal when it is sessioned, and its line
+   discipline delivers ^C/^Z to ITS foreground group (a nested
+   shell's running job, not the shell); any other keyboard pty is
+   not a controlling terminal -- ISIG there would signal an empty
+   foreground group -- and unsessioned tasks have none, so those
+   get killpg, as the real terminal's driver would have. Nonzero =
+   emulate with killpg. */
+static int
+key_signals_here (struct basht_cap *cp, int fd)
+{
+  return cp->sess == 0 || fd < 0 || fd != cp->m_in;
+}
+
 /* Raw pass-through (issue #9): the task asked for keystrokes, so
    it gets them unedited -- escape sequences included; its own echo
    paints the input line, through the display machinery that
    already shows its partials. Only basht's console keys
-   (alt-left/right, stripped from the burst) are withheld. While
-   the slave keeps ISIG, ^C/^Z act on the process group exactly as
-   the tty driver would; with ISIG off they forward as bytes. */
+   (alt-left/right, stripped from the burst; CYCLES clear leaves
+   them alone -- a window's keyboard has no console to cycle) are
+   withheld. While the slave keeps ISIG, ^C/^Z act on the process
+   group exactly as the tty driver would; with ISIG off they
+   forward as bytes. */
 static void
-relay_raw (struct basht_cap *cp, const char *buf, ssize_t n, int isig)
+relay_raw (struct basht_cap *cp, const char *buf, ssize_t n, int isig,
+	   int cycles)
 {
   ssize_t k = 0, mark = 0;
+  int fd = cap_key_fd (cp);
+  int emul = isig && key_signals_here (cp, fd);
 
   while (k < n)
     {
       unsigned char c = (unsigned char)buf[k];
-      if (c == 0x1b && k + 5 < n && buf[k + 1] == '[' && buf[k + 2] == '1'
-	  && buf[k + 3] == ';' && buf[k + 4] == '3'
+      if (cycles && c == 0x1b && k + 5 < n && buf[k + 1] == '['
+	  && buf[k + 2] == '1' && buf[k + 3] == ';' && buf[k + 4] == '3'
 	  && (buf[k + 5] == 'C' || buf[k + 5] == 'D'))
 	{
-	  if (k > mark && cp->m_in >= 0)
-	    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+	  if (k > mark && fd >= 0)
+	    basht_write_all (fd, buf + mark, (size_t)(k - mark));
 	  basht_cycle_owner (buf[k + 5] == 'C' ? 1 : -1);
 	  k += 6;
 	  mark = k;
 	  continue;
 	}
-      if (isig && cp->sess == 0 && (c == 0x03 || c == 0x1a))
+      if (emul && (c == 0x03 || c == 0x1a))
 	{
-	  /* no controlling pty: emulate the driver with killpg.
-	     Sessioned tasks get the bytes; their own line
-	     discipline signals their own foreground group. */
-	  if (k > mark && cp->m_in >= 0)
-	    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+	  if (k > mark && fd >= 0)
+	    basht_write_all (fd, buf + mark, (size_t)(k - mark));
 	  fg_signal (cp->pid, c == 0x03 ? SIGINT : SIGTSTP);
 	  k += 1;
 	  mark = k;
@@ -1347,8 +1397,8 @@ relay_raw (struct basht_cap *cp, const char *buf, ssize_t n, int isig)
 	}
       k++;
     }
-  if (k > mark && cp->m_in >= 0)
-    basht_write_all (cp->m_in, buf + mark, (size_t)(k - mark));
+  if (k > mark && fd >= 0)
+    basht_write_all (fd, buf + mark, (size_t)(k - mark));
 }
 
 /* Keyboard target during a foreground episode: the foreground cap
@@ -1481,8 +1531,9 @@ basht_fg_pump (pid_t pid)
       if (n == 0)
 	{
 	  char e = 0x04;
-	  if (cp->m_in >= 0)
-	    basht_write_all (cp->m_in, &e, 1);
+	  int fd = cap_key_fd (cp);
+	  if (fd >= 0)
+	    basht_write_all (fd, &e, 1);
 	  fg_stdin_open = 0;
 	}
       else if (n > 0)
@@ -1495,8 +1546,9 @@ basht_fg_pump (pid_t pid)
 		{
 		  /* line-mode text typed before the task went raw
 		     belongs to the raw reader */
-		  if (fg_rly.lb.len > fg_rly.lb.fix && cp->m_in >= 0)
-		    basht_write_all (cp->m_in,
+		  int fd = cap_key_fd (cp);
+		  if (fg_rly.lb.len > fg_rly.lb.fix && fd >= 0)
+		    basht_write_all (fd,
 				     fg_rly.lb.data + fg_rly.lb.fix,
 				     fg_rly.lb.len - fg_rly.lb.fix);
 		  if (fg_rly.lb.len > 0)
@@ -1504,7 +1556,7 @@ basht_fg_pump (pid_t pid)
 		      fg_rly.lb.len = fg_rly.lb.cur = fg_rly.lb.fix = 0;
 		      basht_display_stream_gone (&fg_rly);
 		    }
-		  relay_raw (cp, buf, n, isig);
+		  relay_raw (cp, buf, n, isig, 1);
 		}
 	      else
 		relay_chars (cp, &fg_rly, buf, n, 1);
@@ -1514,7 +1566,7 @@ basht_fg_pump (pid_t pid)
 	      /* a background task is selected: same relay the
 		 prompt-time router uses */
 	      if (cap_stdin_raw (tcp, &isig))
-		relay_raw (tcp, buf, n, isig);
+		relay_raw (tcp, buf, n, isig, 1);
 	      else
 		{
 		  prompt_relay_bind (tcp);
@@ -1635,8 +1687,13 @@ basht_send_input (const char *name, int inst, const char *text)
       }
   if (found < 0)
     return -1;
-  basht_write_all (caps[found].m_in, text, strlen (text));
-  basht_write_all (caps[found].m_in, "\n", 1);
+  {
+    int fd = cap_key_fd (&caps[found]);
+    if (fd < 0)
+      return -1;
+    basht_write_all (fd, text, strlen (text));
+    basht_write_all (fd, "\n", 1);
+  }
   return 0;
 }
 
@@ -1984,9 +2041,10 @@ basht_getc (FILE *stream)
 			 raw: the raw reader gets those bytes now */
 		      if (rslot == (int)(cp - caps))
 			{
+			  int kfd = cap_key_fd (cp);
 			  if (prompt_rly.lb.len > prompt_rly.lb.fix
-			      && cp->m_in >= 0)
-			    basht_write_all (cp->m_in,
+			      && kfd >= 0)
+			    basht_write_all (kfd,
 				prompt_rly.lb.data + prompt_rly.lb.fix,
 				prompt_rly.lb.len - prompt_rly.lb.fix);
 			  prompt_rly.lb.len = prompt_rly.lb.cur =
@@ -1994,7 +2052,7 @@ basht_getc (FILE *stream)
 			  basht_display_stream_gone (&prompt_rly);
 			  rslot = -1;
 			}
-		      relay_raw (cp, buf, n, isig);
+		      relay_raw (cp, buf, n, isig, 1);
 		    }
 		  else
 		    {
