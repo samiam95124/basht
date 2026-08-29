@@ -64,8 +64,14 @@ tags off entirely; `unset PST1` restores the default.
   completion work natively, painted by its own echo. A sole command owns
   its pty as controlling terminal, so `/dev/tty` resolves to it — pagers
   (`man`, `less`) and password prompts (`ssh`, `sudo`) work on the
-  console. A nested basht detects the outer one and runs plain rather
-  than double-multiplexing.
+  console. Keystrokes go to whichever of the task's ptys it is actually
+  reading: `less` takes its keyboard from the stderr device (`ttyname(2)`),
+  which under basht is a separate pty, so the relay follows the one the
+  task put into raw mode. Note that `less` (and so `man`) enables the
+  alternate screen at startup, the same tell as `vim`, so it is moved to a
+  window; `export MANPAGER='less -X'` (or `LESS=-RX`) keeps pages on the
+  console, where they read like `more`. A nested basht detects the outer
+  one and runs plain rather than double-multiplexing.
 - **Alt-Left/Right cycles the inputting tasks**: every task currently
   mid-line, the shell included, in a ring — at the prompt and during a
   foreground command alike (the foreground task is always in the ring).
