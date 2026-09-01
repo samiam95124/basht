@@ -2074,6 +2074,22 @@ basht_getc (FILE *stream)
 	  dbg ("getc(e) %s", dbgch (c));
 	  return c;
 	}
+      if (r < 0)
+	{
+	  /* EINTR: in stock bash the signal interrupts the read
+	     inside rl_getc, which post-processes it at once. Here
+	     our select takes the EINTR instead, and looping without
+	     that post-processing leaves a ^C caught-but-pending
+	     until the NEXT keystroke -- whose character is then
+	     destroyed with the line the deferred abort throws away
+	     (^C then `hi' ran `i'). Do what rl_getc's EINTR path
+	     does: fold the caught signal in, then let the event
+	     hook bash armed abort the prompt line now. */
+	  if (rl_pending_signal ())
+	    rl_check_signals ();
+	  if (rl_signal_event_hook)
+	    (*rl_signal_event_hook) ();
+	}
       /* timeout, EINTR, or pty traffic: drain and wait again */
     }
 }
