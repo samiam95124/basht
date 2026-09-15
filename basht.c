@@ -19,12 +19,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -87,6 +89,42 @@ dbgch (int c)
 
 static BASHT_STREAM self;	/* task 0 */
 static int self_master = -1;	/* master side of task 0's pty */
+
+/* ---- the self pump: task 0's master is read by a helper thread --
+
+   The shell writes its own stdout/stderr into the self pty's slave
+   with ordinary blocking writes, and the only reader of that pty's
+   master is this same process. A builtin printing more than the
+   kernel pty queue holds (about 64K: `history' with a long history,
+   `set', `declare -p', `help') therefore blocks in write(2) with
+   nobody left to drain the master -- a deadlock that looked like the
+   shell hanging on `history'. So the master is read by a helper
+   thread that does nothing but move bytes into userspace chunks;
+   the main thread consumes the chunks in drain_self as before.
+
+   The thread stays out of everything the shell considers its own:
+   it never touches the display, malloc (chunks are mmap'd), stdio,
+   or signals (all blocked in it, so SIGCHLD and friends still land
+   on the shell's thread). One mutex guards the chunk list, and a
+   self-pipe wakes the main select loops, which watch its read end
+   in place of the master. pthread_atfork keeps the mutex sane
+   across bash's many forks; a child drops the pending chunks (the
+   parent displays them) and reads the master directly, as before,
+   in the rare cases a subshell drains at all. */
+struct self_chunk
+{
+  struct self_chunk *next;
+  size_t len;
+  unsigned char data[];
+};
+#define SELF_CHUNK_SZ  65536
+#define SELF_CHUNK_CAP (SELF_CHUNK_SZ - sizeof (struct self_chunk))
+
+static pthread_mutex_t self_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct self_chunk *self_head, *self_tail;
+static int self_wake[2] = { -1, -1 };	/* [0] selected on, [1] thread */
+static int self_pump_live;		/* thread up in this process */
+static int self_atfork_set;
 
 /* This process is the multiplexing shell, the one whose fds 1/2 are
    task 0's pty and whose forks become tasks. Cleared in every
@@ -365,10 +403,11 @@ basht_fork_done (pid_t pid)
   pend_slot = -1;
 }
 
-/* Read whatever the task-0 master has. Returns only when the pty is
-   momentarily empty. */
+/* Read whatever the task-0 master has, directly. Returns only when
+   the pty is momentarily empty. The pump-less fallback: thread
+   creation failed, or this is a forked child. */
 static void
-drain_self (void)
+drain_self_direct (void)
 {
   unsigned char buf[4096];
   ssize_t n;
@@ -390,6 +429,192 @@ drain_self (void)
 	continue;
       else
 	break;			/* EOF/EIO cannot happen: we hold the slave */
+    }
+}
+
+static struct self_chunk *
+self_chunk_new (void)
+{
+  void *p = mmap (0, SELF_CHUNK_SZ, PROT_READ | PROT_WRITE,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  struct self_chunk *c;
+
+  if (p == MAP_FAILED)
+    return 0;
+  c = p;
+  c->next = 0;
+  c->len = 0;
+  return c;
+}
+
+/* The pump thread's body: block on the master, append, wake. */
+static void *
+self_pump (void *arg)
+{
+  unsigned char buf[4096];
+  ssize_t n;
+  size_t off, k;
+  struct self_chunk *c;
+
+  for (;;)
+    {
+      n = read (self_master, buf, sizeof buf);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN))
+	continue;
+      if (n <= 0)
+	break;			/* EOF/EIO: the slave is gone */
+      pthread_mutex_lock (&self_mx);
+      for (off = 0; off < (size_t)n; off += k)
+	{
+	  if (self_tail == 0 || self_tail->len == SELF_CHUNK_CAP)
+	    {
+	      while ((c = self_chunk_new ()) == 0)
+		usleep (10000);	/* out of memory: wait it out */
+	      if (self_tail)
+		self_tail->next = c;
+	      else
+		self_head = c;
+	      self_tail = c;
+	    }
+	  k = SELF_CHUNK_CAP - self_tail->len;
+	  if (k > (size_t)n - off)
+	    k = (size_t)n - off;
+	  memcpy (self_tail->data + self_tail->len, buf + off, k);
+	  self_tail->len += k;
+	}
+      pthread_mutex_unlock (&self_mx);
+      (void) write (self_wake[1], "", 1);	/* EAGAIN when full: fine */
+    }
+  return 0;
+}
+
+static void
+self_atfork_prepare (void)
+{
+  if (self_pump_live)
+    pthread_mutex_lock (&self_mx);
+}
+
+static void
+self_atfork_parent (void)
+{
+  if (self_pump_live)
+    pthread_mutex_unlock (&self_mx);
+}
+
+static void
+self_atfork_child (void)
+{
+  if (self_pump_live == 0)
+    return;
+  /* the pump did not survive the fork; the chunks it left are the
+     parent's to display */
+  pthread_mutex_unlock (&self_mx);
+  self_head = self_tail = 0;
+  self_pump_live = 0;
+}
+
+/* Start the pump for SELF_MASTER. Failure leaves the direct path in
+   place, which works until a burst outgrows the pty queue. */
+static void
+self_pump_start (void)
+{
+  sigset_t all, old;
+  pthread_t thr;
+  pthread_attr_t at;
+
+  if (self_atfork_set == 0)
+    {
+      if (pthread_atfork (self_atfork_prepare, self_atfork_parent,
+			  self_atfork_child) != 0)
+	return;
+      self_atfork_set = 1;
+    }
+  if (pipe (self_wake) < 0)
+    {
+      self_wake[0] = self_wake[1] = -1;
+      return;
+    }
+  for (int i = 0; i < 2; i++)
+    {
+      fcntl (self_wake[i], F_SETFD, FD_CLOEXEC);
+      fcntl (self_wake[i], F_SETFL, O_NONBLOCK);
+    }
+  self_head = self_tail = 0;
+  self_pump_live = 1;		/* before create: atfork sees it */
+  sigfillset (&all);
+  pthread_sigmask (SIG_BLOCK, &all, &old);
+  pthread_attr_init (&at);
+  pthread_attr_setdetachstate (&at, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize (&at, 65536);
+  if (pthread_create (&thr, &at, self_pump, 0) != 0)
+    {
+      self_pump_live = 0;
+      close (self_wake[0]);
+      close (self_wake[1]);
+      self_wake[0] = self_wake[1] = -1;
+    }
+  pthread_attr_destroy (&at);
+  pthread_sigmask (SIG_SETMASK, &old, 0);
+  dbg ("self pump %s", self_pump_live ? "up" : "not started");
+}
+
+/* The fd the select loops watch for task-0 output. */
+static int
+self_read_fd (void)
+{
+  return self_pump_live ? self_wake[0] : self_master;
+}
+
+/* Take everything the pump has collected and display it. */
+static void
+drain_self (void)
+{
+  struct self_chunk *c, *next;
+  char junk[64];
+
+  if (self_pump_live == 0)
+    {
+      drain_self_direct ();
+      return;
+    }
+  /* Callers rely on the old synchronous contract: what the shell
+     wrote before this call is displayed by the time it returns (the
+     accepted-line echo before a command runs, the last output
+     before exit). The thread may not have fetched it yet, so while
+     the master still shows readable, give the pump a moment. A
+     subshell sharing the slave (command substitution's stderr) can
+     keep it readable, hence the cap. */
+  for (int i = 0; i < 50; i++)
+    {
+      fd_set rf;
+      struct timeval tv;
+
+      FD_ZERO (&rf);
+      FD_SET (self_master, &rf);
+      tv.tv_sec = tv.tv_usec = 0;
+      if (select (self_master + 1, &rf, 0, 0, &tv) <= 0)
+	break;
+      FD_ZERO (&rf);
+      FD_SET (self_wake[0], &rf);
+      tv.tv_sec = 0;
+      tv.tv_usec = 20000;
+      select (self_wake[0] + 1, &rf, 0, 0, &tv);
+    }
+  /* wake pipe first, list second: a wake that slips in between is
+     spurious, one lost the other way could strand bytes until the
+     next timeout */
+  while (read (self_wake[0], junk, sizeof junk) > 0)
+    ;
+  pthread_mutex_lock (&self_mx);
+  c = self_head;
+  self_head = self_tail = 0;
+  pthread_mutex_unlock (&self_mx);
+  for (; c; c = next)
+    {
+      next = c->next;
+      basht_filter_bytes (&self, c->data, c->len, 0);
+      munmap (c, SELF_CHUNK_SZ);
     }
 }
 
@@ -1495,9 +1720,10 @@ basht_fg_pump (pid_t pid)
     }
   if (self_master >= 0)
     {
-      FD_SET (self_master, &rf);
-      if (self_master > maxfd)
-	maxfd = self_master;
+      int sfd = self_read_fd ();
+      FD_SET (sfd, &rf);
+      if (sfd > maxfd)
+	maxfd = sfd;
     }
   for (i = 0; i < BASHT_MAX_CAPS; i++)
     {
@@ -1995,9 +2221,10 @@ basht_getc (FILE *stream)
       maxfd = fd;
       if (self_master >= 0)
 	{
-	  FD_SET (self_master, &rf);
-	  if (self_master > maxfd)
-	    maxfd = self_master;
+	  int sfd = self_read_fd ();
+	  FD_SET (sfd, &rf);
+	  if (sfd > maxfd)
+	    maxfd = sfd;
 	}
       for (int i = 0; i < BASHT_MAX_CAPS; i++)
 	{
@@ -2211,6 +2438,7 @@ basht_init (void)
 
   self_shell = 1;
   basht_active = 1;
+  self_pump_start ();
 }
 
 /* ---- `task' builtin: stand the multiplexer down and back up -----
