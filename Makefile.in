@@ -145,7 +145,7 @@ LOCAL_DEFS = @LOCAL_DEFS@
 LOCALE_DEFS = -DLOCALEDIR='"$(localedir)"' -DPACKAGE='"$(PACKAGE)"'
 
 LOCAL_LIBS = @LOCAL_LIBS@
-LIBS = $(BUILTINS_LIB) $(LIBRARIES) @LIBS@
+LIBS = $(BUILTINS_LIB) $(LIBRARIES) $(BASHT_LIBS) @LIBS@
 LIBS_FOR_BUILD = 
 
 STATIC_LD = @STATIC_LD@
@@ -584,6 +584,10 @@ PSIZE_SOURCE	= $(DEFSRC)/psize.sh $(DEFSRC)/psize.c
 
 BUILTINS_LIBRARY = $(DEFDIR)/libbuiltins.a
 BUILTINS_LIB = -lbuiltins
+
+# basht pumps task 0's pty from a helper thread (basht.c); older glibc
+# keeps the pthread functions in a separate library.
+BASHT_LIBS = -lpthread
 BUILTINS_LDFLAGS = -L$(DEFDIR)
 BUILTINS_DEP = $(BUILTINS_LIBRARY)
 
